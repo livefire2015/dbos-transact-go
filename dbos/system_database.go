@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -14,16 +15,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-//go:embed migrations/*.sql
-var migrationFiles embed.FS
-
 type SystemDatabase interface {
-	Close() error
+	Destroy() error
+	InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error)
 }
 
 type systemDatabase struct {
 	pool *pgxpool.Pool
 }
+
+/*******************************/
+/******* INITIALIZATION ********/
+/*******************************/
 
 // createDatabaseIfNotExists creates the database if it doesn't exist
 func createDatabaseIfNotExists(databaseURL string) error {
@@ -65,7 +68,10 @@ func createDatabaseIfNotExists(databaseURL string) error {
 	return nil
 }
 
-// runMigrations runs the embedded migration files
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
+
+// TODO: must use the systemdb name
 func runMigrations(databaseURL string) error {
 	// Change the driver to pgx5
 	databaseURL = "pgx5://" + strings.TrimPrefix(databaseURL, "postgres://")
@@ -128,7 +134,108 @@ func NewSystemDatabase() (SystemDatabase, error) {
 	}, nil
 }
 
-func (s *systemDatabase) Close() error {
+func (s *systemDatabase) Destroy() error {
 	s.pool.Close()
 	return nil
+}
+
+/*******************************/
+/******* STATUS MANAGEMENT ********/
+/*******************************/
+
+type InsertWorkflowResult struct {
+	Attempts                int    `json:"recovery_attempts"`
+	Status                  string `json:"status"`
+	Name                    string `json:"name"`
+	ClassName               string `json:"class_name"`
+	ConfigName              string `json:"config_name"`
+	QueueName               string `json:"queue_name"`
+	WorkflowDeadlineEpochMs *int64 `json:"workflow_deadline_epoch_ms"`
+}
+
+func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error) {
+	// Set default values
+	attempts := 1
+	if initStatus.Status == "ENQUEUED" {
+		attempts = 0
+	}
+
+	updatedAt := initStatus.UpdatedAt
+	if updatedAt == nil {
+		now := time.Now()
+		updatedAt = &now
+	}
+
+	var deadline *int64 = nil
+	if initStatus.Deadline != nil {
+		millis := initStatus.Deadline.UnixMilli()
+		deadline = &millis
+	}
+
+	query := `INSERT INTO dbos.workflow_status (
+        workflow_uuid,
+        status,
+        name,
+        class_name,
+        config_name,
+        queue_name,
+        authenticated_user,
+        assumed_role,
+        authenticated_roles,
+        executor_id,
+        application_version,
+        application_id,
+        created_at,
+        recovery_attempts,
+        updated_at,
+        workflow_timeout_ms,
+        workflow_deadline_epoch_ms,
+        inputs,
+        deduplication_id,
+        priority
+    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+    ON CONFLICT (workflow_uuid)
+        DO UPDATE SET
+            recovery_attempts = workflow_status.recovery_attempts + 1,
+            updated_at = EXCLUDED.updated_at,
+            executor_id = EXCLUDED.executor_id
+        RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, workflow_deadline_epoch_ms`
+
+	var result InsertWorkflowResult
+	err := s.pool.QueryRow(ctx, query,
+		initStatus.ID,
+		initStatus.Status,
+		initStatus.Name,
+		"", // WorkflowClassName is not used in the query, so we pass an empty string
+		"", // WorkflowConfigName is not used in the query, so we pass an empty string
+		"", // initStatus.QueueName,
+		"", // initStatus.AuthenticatedUser,
+		"", // initStatus.AssumedRole,
+		"", // string(authenticatedRolesJSON),
+		initStatus.ExecutorID,
+		initStatus.ApplicationVersion,
+		initStatus.ApplicationID,
+		initStatus.CreatedAt.UnixMilli(),
+		attempts,
+		updatedAt.UnixMilli(),
+		initStatus.Timeout.Milliseconds(),
+		deadline,
+		initStatus.Input,
+		"", // initStatus.DeduplicationID,
+		1,  // initStatus.Priority,
+	).Scan(
+		&result.Attempts,
+		&result.Status,
+		&result.Name,
+		&result.ClassName,
+		&result.ConfigName,
+		&result.QueueName,
+		&result.WorkflowDeadlineEpochMs, // We should convert this to a time.Time
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert workflow status: %w", err)
+	}
+
+	return &result, nil
 }

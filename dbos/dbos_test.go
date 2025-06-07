@@ -26,29 +26,23 @@ func TestTransact(t *testing.T) {
 		t.Skip("DBOS_DATABASE_URL not set, skipping integration test")
 	}
 
-	dbos, err := New()
+	err := Launch()
 	if err != nil {
 		t.Fatalf("failed to create DBOS instance: %v", err)
 	}
-	defer dbos.Close()
+	defer Destroy()
 
 	if dbos == nil {
 		t.Fatal("expected DBOS instance but got nil")
 	}
 
-	// Test that we can access the system database
-	systemDB := dbos.SystemDB()
-	if systemDB == nil {
-		t.Fatal("expected system database but got nil")
-	}
+	// TEST A WORKFLOW
+	wf1Handle := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
+	result, err := wf1Handle.GetResult()
+	fmt.Printf("Workflow result: %s, error: %v\n", result, err)
 
-	// Test closing
-	if err := dbos.Close(); err != nil {
+	if err := Destroy(); err != nil {
 		t.Errorf("error closing DBOS: %v", err)
 	}
 
-	// TEST A WORKFLOW
-	wf1Handle := w1(context.Background(), "no!")
-	result, err := wf1Handle.GetResult()
-	fmt.Printf("Workflow result: %s, error: %v\n", result, err)
 }

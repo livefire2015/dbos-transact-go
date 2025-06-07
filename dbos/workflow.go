@@ -2,12 +2,30 @@ package dbos
 
 import (
 	"context"
+	"time"
+
+	"github.com/google/uuid"
 )
 
-type WorkflowParams struct {
-	WorkflowID string
+type WorkflowStatus struct {
+	Name               string
+	Status             string // TODO make an enum type
+	ID                 string
+	ExecutorID         string
+	ApplicationVersion *string
+	ApplicationID      string
+	CreatedAt          time.Time
+	UpdatedAt          *time.Time
+	Timeout            time.Duration
+	Deadline           *time.Time // FIXME: maybe set this as an *int64 in milliseconds?
+	Input              any
+	Attempts           int
+	// Add remaining fields
 }
 
+/********************************/
+/******* WORKFLOW HANDLE ********/
+/********************************/
 type WorkflowHandle[R any] interface {
 	GetResult() (R, error)
 }
@@ -33,17 +51,42 @@ func (h *workflowHandle[R]) GetResult() (R, error) {
 	}
 }
 
+/********************************/
+/******* WORKFLOW FUNCTION *******/
+/********************************/
 type WorkflowFunc[P any, R any] func(ctx context.Context, input P) (R, error)
 
-// TODO: name can be found using reflection
-func WithWorkflow[P any, R any](name string, fn WorkflowFunc[P, R]) func(ctx context.Context, input P) WorkflowHandle[R] {
+type WorkflowParams struct {
+	WorkflowID string
+	Timeout    time.Duration
+}
+
+func WithWorkflow[P any, R any](name string, fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
+	// TODO: name can be found using reflection. Must be FQDN.
 	registerWorkflow(name, fn)
-	return func(ctx context.Context, input P) WorkflowHandle[R] {
-		return runAsWorkflow(ctx, fn, input)
+	return func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
+		return runAsWorkflow(ctx, params, fn, input)
 	}
 }
 
-func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], input P) WorkflowHandle[R] {
+func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) WorkflowHandle[R] {
+	// Generate an ID for the workflow if not provided
+	if params.WorkflowID == "" {
+		params.WorkflowID = uuid.New().String()
+	}
+
+	workflowStatus := WorkflowStatus{
+		Status:    "PENDING",
+		ID:        params.WorkflowID,
+		CreatedAt: time.Now(),
+	}
+
+	// Init status // TODO: implement init status validation
+	_, err := getExecutor().systemDB.InsertWorkflowStatus(ctx, workflowStatus)
+	if err != nil {
+		panic("failed to insert workflow status: " + err.Error())
+	}
+
 	// Channel to receive the result from the goroutine
 	resultChan := make(chan R, 1)
 	errorChan := make(chan error, 1)

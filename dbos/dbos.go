@@ -4,35 +4,52 @@ import (
 	"fmt"
 )
 
+type Executor interface {
+	Destroy() error
+}
+
 // DBOS represents the main DBOS instance
-type DBOS struct {
-	// XXX does this need to be private?
+type executor struct {
 	systemDB SystemDatabase
 }
 
 // New creates a new DBOS instance with an initialized system database
-func New() (*DBOS, error) {
+var dbos *executor
+
+func getExecutor() *executor {
+	// TODO find a good strategy
+	if dbos == nil {
+		panic("DBOS instance is not initialized")
+	}
+	return dbos
+}
+
+func Launch() error {
+	if dbos != nil {
+		// XXX: maybe just log a warning instead of returning an error
+		return fmt.Errorf("DBOS already initialized")
+	}
 	// Create the system database
 	systemDB, err := NewSystemDatabase()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create system database: %w", err)
+		return fmt.Errorf("failed to create system database: %w", err)
 	}
 
-	return &DBOS{
+	dbos = &executor{
 		systemDB: systemDB,
-	}, nil
-}
-
-// Close closes the DBOS instance and its resources
-// TODO: rename destroy
-func (d *DBOS) Close() error {
-	if d.systemDB != nil {
-		return d.systemDB.Close()
 	}
 	return nil
 }
 
-// SystemDB returns the system database instance
-func (d *DBOS) SystemDB() SystemDatabase {
-	return d.systemDB
+// Close closes the DBOS instance and its resources
+// TODO: rename destroy
+func Destroy() error {
+	if dbos == nil {
+		// FIXME: just emit a warning
+		return fmt.Errorf("DBOS instance is nil, cannot destroy")
+	}
+	if dbos.systemDB != nil {
+		return dbos.systemDB.Destroy()
+	}
+	return nil
 }
