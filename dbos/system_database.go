@@ -160,14 +160,13 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
 		attempts = 0
 	}
 
-	updatedAt := initStatus.UpdatedAt
-	if updatedAt == nil {
-		now := time.Now()
-		updatedAt = &now
+	updatedAt := time.Now()
+	if !initStatus.UpdatedAt.IsZero() {
+		updatedAt = initStatus.UpdatedAt
 	}
 
 	var deadline *int64 = nil
-	if initStatus.Deadline != nil {
+	if !initStatus.Deadline.IsZero() {
 		millis := initStatus.Deadline.UnixMilli()
 		deadline = &millis
 	}

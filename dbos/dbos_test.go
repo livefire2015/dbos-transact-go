@@ -40,9 +40,4 @@ func TestTransact(t *testing.T) {
 	wf1Handle := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
 	result, err := wf1Handle.GetResult()
 	fmt.Printf("Workflow result: %s, error: %v\n", result, err)
-
-	if err := Destroy(); err != nil {
-		t.Errorf("error closing DBOS: %v", err)
-	}
-
 }

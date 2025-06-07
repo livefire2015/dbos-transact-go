@@ -15,9 +15,9 @@ type WorkflowStatus struct {
 	ApplicationVersion *string
 	ApplicationID      string
 	CreatedAt          time.Time
-	UpdatedAt          *time.Time
+	UpdatedAt          time.Time
 	Timeout            time.Duration
-	Deadline           *time.Time // FIXME: maybe set this as an *int64 in milliseconds?
+	Deadline           time.Time // FIXME: maybe set this as an *int64 in milliseconds?
 	Input              any
 	Attempts           int
 	// Add remaining fields
@@ -46,6 +46,7 @@ func (h *workflowHandle[R]) GetResult() (R, error) {
 		var zero R
 		return zero, err
 	case <-h.ctx.Done():
+		// This handles timeouts
 		var zero R
 		return zero, h.ctx.Err()
 	}
@@ -59,6 +60,7 @@ type WorkflowFunc[P any, R any] func(ctx context.Context, input P) (R, error)
 type WorkflowParams struct {
 	WorkflowID string
 	Timeout    time.Duration
+	Deadline   time.Time
 }
 
 func WithWorkflow[P any, R any](name string, fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
@@ -75,10 +77,19 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		params.WorkflowID = uuid.New().String()
 	}
 
+	// Compute the deadline
+	var deadline time.Time
+	if params.Timeout > 0 {
+		deadline = time.Now().Add(params.Timeout)
+	} else if !params.Deadline.IsZero() {
+		deadline = params.Deadline
+	}
+
 	workflowStatus := WorkflowStatus{
 		Status:    "PENDING",
 		ID:        params.WorkflowID,
 		CreatedAt: time.Now(),
+		Deadline:  deadline,
 	}
 
 	// Init status // TODO: implement init status validation
@@ -88,14 +99,25 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	}
 
 	// Channel to receive the result from the goroutine
+	// The buffer size of 1 allows the goroutine to send the result without blocking
+	// In addition it allows the channel to be garbage collected
 	resultChan := make(chan R, 1)
 	errorChan := make(chan error, 1)
 
 	// Create the handle
+	userFunctionContext := ctx
+	var userFunctionCancel context.CancelFunc
+	if params.Timeout > 0 {
+		userFunctionContext, userFunctionCancel = context.WithTimeout(ctx, params.Timeout)
+		defer userFunctionCancel() // Ensure the context is cancelled to free resources
+	} else if !params.Deadline.IsZero() {
+		userFunctionContext, userFunctionCancel = context.WithDeadline(ctx, params.Deadline)
+		defer userFunctionCancel() // Ensure the context is cancelled to free resources
+	}
 	handle := &workflowHandle[R]{
 		resultChan: resultChan,
 		errorChan:  errorChan,
-		ctx:        ctx,
+		ctx:        userFunctionContext,
 	}
 
 	// Run the function in a goroutine
