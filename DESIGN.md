@@ -1,11 +1,18 @@
 # Outline
 
-- [Library overview](#library-overview)
+- [Library Overview](#library-overview)
 - [Wrapping functions in Durable Workflows](#wrapping-functions)
 - [DBOS Registry](#registry)
-- [Executing user code](#executing-user-code)
-
-
+- [Executing User Code](#executing-user-code)
+- [System Database](#system-database)
+- [Client](#client)
+- [Config](#config)
+- [Logging](#logging)
+- [Tracing](#tracing)
+- [CLI](#cli)
+- [docs](#docs)
+- [Package Management](#package-management)
+- [Golang quircks](#golang-quircks)
 
 # Library overview
 
@@ -124,30 +131,29 @@ The easiest solution, which we started with, is to ask users to declare their wr
 
 We can automate this by writing a `go generate` script, which would parse the AST and generate an `init` function performing the registration, guaranteeing functions are registered before the program's `main` function is executed.
 
-
 # Executing user code
 
-- In their own goroutine with an execution wrapper that'll intercept exceptions
-- The goroutine will write the results to a channel
-- The handler will have access to a channel with the goroutine to check on result
-- We will see the goroutine wrapper with our context object that'll have, e.g., the deadline
+We will run user provided functions in goroutines. In fact, we will need two goroutine:
+1. A very simple wrapper than can run the user function and notify of success/error
+2. A "monitor" goroutine that will handle the system database management and timeouts/cancellations on the context.
 
-Must:
-- be able to catch specific errors
-- do we catch panics?
+Note that Golang scheduling model is mostly cooperative, so even if we learn a goroutine's context is cancelled, we cannot, without user support, interrupt their execution.
 
-## Goroutine wrappers
-## Workflow handles
+We'll be able to do a few thing through the user function wrapper, for example handling panics to not crash the entire program.
+
 ## Contexts
 
-The simplest would be to derive new contexts from user-provided contexts, so they can cooperate better with the framework -- without having to.
+We have two choices: either augment the user-provided context, or use a totally different one for DBOS operations. The former has the benefit of allowing a user to get access to DBOS metadata and other information natively, whereas the later allows a better decoupling of user code and Transact.
 
-### Timeout, deadlines and cancellation
+I'd favor the later for now.
 
 ### Parent-Child relationships
 
-# Serializing inputs/outputs
-maybe this should be a broader "system tables management" section
+We will derive children context from parent context -- easily. We'll just be careful to avoid "deep context chains".
+
+# System Database
+## Serializing inputs/outputs
+TBD: settle on a library. There is one that's pickling in binary, pretty efficient, but not compatible across languages, which is not a concern for us today.
 
 # Database management
 We will use the golang-migrate package to automatically run migrations when a system database is created. The migrations are embedded in the program binary with `go:embed`.
@@ -165,14 +171,6 @@ To explore: some loggers already support OTLP export, some require a "bridge". T
 - We'll export the tracer
 - How will we play with the global tracer this time?
 
-# Determinism
-- Concurrent go routines will run in a non-deterministic order
-- 	for key, value := range data { // where data map[string]int is non-deterministic
-- select choses randomly in a list of channels
-- select based on a "race" between multiple goroutines (like Promise.race() or asyncio.gather())
-- Ofc ASLR, random numbers, etc
-
-
 # Command line
 
 # Docs
@@ -182,3 +180,11 @@ We will use go:doc to automatically generate the documentation
 # Package management
 
 The package will be "published" on its github repo. Package versions are managed with git tags.
+
+# Golang quircks
+## Determinism
+- Concurrent go routines will run in a non-deterministic order
+- 	for key, value := range data { // where data map[string]int is non-deterministic
+- select choses randomly in a list of channels
+- select based on a "race" between multiple goroutines (like Promise.race() or asyncio.gather())
+- Ofc ASLR, random numbers, etc

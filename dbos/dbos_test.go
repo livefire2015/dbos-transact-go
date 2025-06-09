@@ -20,7 +20,6 @@ func userFunc1(ctx context.Context, input string) (string, error) {
 
 func TestTransact(t *testing.T) {
 	fmt.Println(registry)
-	// TEST DBOS OBJECT
 	databaseURL := os.Getenv("DBOS_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("DBOS_DATABASE_URL not set, skipping integration test")
@@ -36,7 +35,6 @@ func TestTransact(t *testing.T) {
 		t.Fatal("expected DBOS instance but got nil")
 	}
 
-	// TEST A WORKFLOW
 	wf1Handle := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
 	result, err := wf1Handle.GetResult()
 	fmt.Printf("Workflow result: %s, error: %v\n", result, err)

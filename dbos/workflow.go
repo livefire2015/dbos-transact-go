@@ -2,6 +2,7 @@ package dbos
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,6 +39,7 @@ type workflowHandle[R any] struct {
 }
 
 // GetResult waits for the workflow to complete and returns the result
+// TODO: for now this uses channels, but will be replaced with system DB lookups
 func (h *workflowHandle[R]) GetResult() (R, error) {
 	select {
 	case result := <-h.resultChan:
@@ -122,11 +124,34 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 
 	// Run the function in a goroutine
 	go func() {
+		defer func() {
+			// Avoid crashing the application if the workflow function panics
+			if r := recover(); r != nil {
+				errorChan <- fmt.Errorf("workflow function panicked: %v", r)
+			}
+		}()
 		result, err := fn(ctx, input)
 		if err != nil {
 			errorChan <- err
 		} else {
 			resultChan <- result
+		}
+	}()
+
+	// Run the peer goroutine to handle cancellation and timeout
+	go func() {
+		select {
+		case result := <-resultChan:
+			// Record the result
+			return
+		case err := <-errorChan:
+			// Record error
+			return
+		case <-userFunctionContext.Done():
+			// the context was cancelled or timed out
+			// Record timeout or cancellation
+			return
+
 		}
 	}()
 
