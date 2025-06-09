@@ -1,4 +1,6 @@
-# Outline
+# DBOS Transact Go - Design Document
+
+## Outline
 
 - [Library Overview](#library-overview)
 - [Wrapping functions in Durable Workflows](#wrapping-functions)
@@ -14,7 +16,7 @@
 - [Package Management](#package-management)
 - [Golang quircks](#golang-quircks)
 
-# Library overview
+## Library overview
 
 The library will require go 1.23.0 (we can discuss reducing this requirement)
 
@@ -37,9 +39,9 @@ The import path will be `github.com/dbos-inc/dbos-transact-go/dbos` (to comply b
 └── README.md
 ```
 
-# Wrapping functions
+## Wrapping functions
 
-## Overview
+### Overview
 
 ```golang
 func WithWorkflow[P any, R any](name string, fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
@@ -70,9 +72,9 @@ func (s *myService) myFuncton() {
 }
 ```
 
-## Signatures
+### Signatures
 
-### Generics
+#### Generics
 
 Go doesn't support (yet) variadic generic parameters, so for example we cannot do:
 ```golang
@@ -80,7 +82,7 @@ func WithWorkflow[T1, T2, ...TN any, ...RN any](fn func(T1, T2, ...TN) (R1, R2, 
 ```
 Support for generic is limited to fixed number of parameters, which is prohibitive in our use case.
 
-### Typeless wrappers
+#### Typeless wrappers
 
 To capture arbitrary user-defined functions, we must use a typeless signature and use Reflection to validate and call the user code. Take this simplified wrapper that accepts a user function and returns a wrapped function that directly calls the user code:
 
@@ -100,7 +102,7 @@ To capture arbitrary user-defined functions, we must use a typeless signature an
 
 `fn` is not directly usable and must be thoroughly validated first. Reflection introduces performance overheads (under 1 millisecond) which can be optimized with caching (to be explored).
 
-### Constrained types
+#### Constrained types
 To iterate faster, we settled on this:
 
 ```golang
@@ -119,7 +121,7 @@ Contexts are most useful in server programs, so not all programs use contexts ev
 Input and output parameters can be structures, so this remains flexible. Again, we can automate handling arbitrary numbers of input/output parameters with a typeless interface and runtime Reflection.
 
 
-# Registry
+## Registry
 
 Go doesn't have decorators, which can be used to perform stuff before the program actually runs, including registering operations.
 A Go package initialization order is:
@@ -131,7 +133,7 @@ The easiest solution, which we started with, is to ask users to declare their wr
 
 We can automate this by writing a `go generate` script, which would parse the AST and generate an `init` function performing the registration, guaranteeing functions are registered before the program's `main` function is executed.
 
-# Executing user code
+## Executing user code
 
 We will run user provided functions in goroutines. In fact, we will need two goroutine:
 1. A very simple wrapper than can run the user function and notify of success/error
@@ -141,48 +143,48 @@ Note that Golang scheduling model is mostly cooperative, so even if we learn a g
 
 We'll be able to do a few thing through the user function wrapper, for example handling panics to not crash the entire program.
 
-## Contexts
+### Contexts
 
 We have two choices: either augment the user-provided context, or use a totally different one for DBOS operations. The former has the benefit of allowing a user to get access to DBOS metadata and other information natively, whereas the later allows a better decoupling of user code and Transact.
 
 I'd favor the later for now.
 
-### Parent-Child relationships
+#### Parent-Child relationships
 
 We will derive children context from parent context -- easily. We'll just be careful to avoid "deep context chains".
 
-# System Database
-## Serializing inputs/outputs
+## System Database
+### Serializing inputs/outputs
 TBD: settle on a library. There is one that's pickling in binary, pretty efficient, but not compatible across languages, which is not a concern for us today.
 
-# Database management
+## Database management
 We will use the golang-migrate package to automatically run migrations when a system database is created. The migrations are embedded in the program binary with `go:embed`.
 
 WIP: How to receive user provided datasources.
 
-# Client
+## Client
 
-# Config
+## Config
 
-# Logging
+## Logging
 To explore: some loggers already support OTLP export, some require a "bridge". The idea should that we'll support users bringing their own logger for the 4 major loggers (logrus, zap, slog) and use them as an OTLP logger provider transparently.
 
-# Tracing
+## Tracing
 - We'll export the tracer
 - How will we play with the global tracer this time?
 
-# Command line
+## Command line
 
-# Docs
+## Docs
 
 We will use go:doc to automatically generate the documentation
 
-# Package management
+## Package management
 
 The package will be "published" on its github repo. Package versions are managed with git tags.
 
-# Golang quircks
-## Determinism
+## Golang quircks
+### Determinism
 - Concurrent go routines will run in a non-deterministic order
 - 	for key, value := range data { // where data map[string]int is non-deterministic
 - select choses randomly in a list of channels
