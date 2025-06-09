@@ -1,6 +1,6 @@
 # DBOS Transact Go - Design Document
 
-## Outline
+## Outline
 
 - [Library Overview](#library-overview)
 - [Wrapping functions in Durable Workflows](#wrapping-functions)
@@ -16,7 +16,7 @@
 - [Package Management](#package-management)
 - [Golang quircks](#golang-quircks)
 
-## Library overview
+## Library overview
 
 The library will require go 1.23.0 (we can discuss reducing this requirement)
 
@@ -39,7 +39,7 @@ The import path will be `github.com/dbos-inc/dbos-transact-go/dbos` (to comply b
 └── README.md
 ```
 
-## Wrapping functions
+## Wrapping functions
 
 ### Overview
 
