@@ -78,9 +78,8 @@ type WorkflowParams struct {
 }
 
 func WithWorkflow[P any, R any](name string, fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
-	// TODO: name can be found using reflection. Must be FQDN.
 	// Also we should register the wrapped function
-	registerWorkflow(name, fn)
+	registerWorkflow(fn)
 	return func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
 		return runAsWorkflow(ctx, params, fn, input)
 	}
@@ -212,7 +211,7 @@ type StepParams struct {
 
 func WithStep[P any, R any](name string, fn StepFunc[P, R]) func(ctx context.Context, params StepParams, input P) (R, error) {
 	// TODO : name can be found using reflection. Must be FQDN.
-	registerWorkflow(name, fn)
+	registerWorkflow(fn)
 	return func(ctx context.Context, params StepParams, input P) (R, error) {
 		return runAsStep(ctx, params, fn, input)
 	}
