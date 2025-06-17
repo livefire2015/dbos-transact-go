@@ -46,4 +46,13 @@ func TestTransact(t *testing.T) {
 	fmt.Println("Workflow handle:", wf1Handle)
 	result, err := wf1Handle.GetResult()
 	fmt.Printf("Workflow result: %s, error: %v\n", result, err)
+
+	// Check list workflows
+	wfList, err := dbos.systemDB.ListWorkflows(context.Background(), ListWorkflowsDBInput{})
+	if err != nil {
+		t.Fatalf("failed to list workflows: %v", err)
+	}
+	for _, wf := range wfList {
+		fmt.Printf("Workflow ID: %s, Status: %s\n", wf.ID, wf.Status)
+	}
 }

@@ -9,19 +9,27 @@ import (
 )
 
 type WorkflowStatus struct {
-	Name               string
-	Status             string // TODO make an enum type
-	ID                 string
-	ExecutorID         string
-	ApplicationVersion *string
-	ApplicationID      string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-	Timeout            time.Duration
-	Deadline           time.Time // FIXME: maybe set this as an *int64 in milliseconds?
-	Input              any
-	Attempts           int
-	// Add remaining fields
+	ID                 string        `json:"workflow_uuid"`
+	Status             string        `json:"status"`
+	Name               string        `json:"name"`
+	AuthenticatedUser  *string       `json:"authenticated_user"`
+	AssumedRole        *string       `json:"assumed_role" db:"assumed_role"`
+	AuthenticatedRoles *string       `json:"authenticated_roles" db:"authenticated_roles"`
+	Output             any           `json:"output" db:"output"`
+	Error              error         `json:"error" db:"error"`
+	ExecutorID         *string       `json:"executor_id" db:"executor_id"`
+	CreatedAt          time.Time     `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at" db:"updated_at"`
+	ApplicationVersion *string       `json:"application_version" db:"application_version"`
+	ApplicationID      *string       `json:"application_id" db:"application_id"`
+	Attempts           int           `json:"attempts" db:"attempts"`
+	QueueName          *string       `json:"queue_name" db:"queue_name"`
+	Timeout            time.Duration `json:"-" db:"-"` // Converted to/from workflow_timeout_ms
+	Deadline           time.Time     `json:"-" db:"-"` // Converted to/from workflow_deadline_epoch_ms
+	StartedAt          time.Time     `json:"-" db:"-"` // Converted to/from started_at_epoch_ms
+	DeduplicationID    *string       `json:"deduplication_id" db:"deduplication_id"`
+	Input              any           `json:"-" db:"-"` // Converted to/from inputs
+	Priority           int           `json:"priority" db:"priority"`
 }
 
 // WorkflowState holds the runtime state for a workflow execution
@@ -116,10 +124,13 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	}
 
 	workflowStatus := WorkflowStatus{
-		Status:    "PENDING",
-		ID:        params.WorkflowID,
-		CreatedAt: time.Now(),
-		Deadline:  deadline,
+		Status:        "PENDING",
+		ID:            params.WorkflowID,
+		CreatedAt:     time.Now(),
+		Deadline:      deadline,
+		Timeout:       params.Timeout,
+		Input:         input,
+		ApplicationID: nil, // TODO: set application ID if available
 	}
 
 	// Init status // TODO: implement init status validation
