@@ -39,7 +39,10 @@ func TestTransact(t *testing.T) {
 		t.Fatal("expected DBOS instance but got nil")
 	}
 
-	wf1Handle := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
+	wf1Handle, err := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
+	if err != nil {
+		t.Fatalf("failed to run workflow: %v", err)
+	}
 	fmt.Println("Workflow handle:", wf1Handle)
 	result, err := wf1Handle.GetResult()
 	fmt.Printf("Workflow result: %s, error: %v\n", result, err)

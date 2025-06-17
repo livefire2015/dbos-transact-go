@@ -77,16 +77,16 @@ type WorkflowParams struct {
 	Deadline   time.Time
 }
 
-func WithWorkflow[P any, R any](name string, fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
+func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
 	// Also we should register the wrapped function
 	registerWorkflow(fn)
-	return func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
+	return func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
 		return runAsWorkflow(ctx, params, fn, input)
 	}
 }
 
 // TODO also return errors
-func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) WorkflowHandle[R] {
+func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) (WorkflowHandle[R], error) {
 	// First, create a context for the workflow
 	dbosWorkflowContext := context.Background()
 
@@ -125,8 +125,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	// Init status // TODO: implement init status validation
 	_, err := getExecutor().systemDB.InsertWorkflowStatus(dbosWorkflowContext, workflowStatus)
 	if err != nil {
-		// TODO handle errors properly
-		panic("failed to insert workflow status: " + err.Error())
+		return nil, fmt.Errorf("inserting workflow status: %w", err)
 	}
 
 	// Channel to receive the result from the goroutine
@@ -195,7 +194,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	}
 
 	fmt.Println("Returning workflow handle for workflow ID:", params.WorkflowID)
-	return handle
+	return handle, nil
 }
 
 /******************************/
@@ -209,7 +208,7 @@ type StepParams struct {
 	BackoffRate int
 }
 
-func WithStep[P any, R any](name string, fn StepFunc[P, R]) func(ctx context.Context, params StepParams, input P) (R, error) {
+func WithStep[P any, R any](fn StepFunc[P, R]) func(ctx context.Context, params StepParams, input P) (R, error) {
 	// TODO : name can be found using reflection. Must be FQDN.
 	registerWorkflow(fn)
 	return func(ctx context.Context, params StepParams, input P) (R, error) {
