@@ -18,6 +18,8 @@ import (
 type SystemDatabase interface {
 	Destroy() error
 	InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error)
+	RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error
+	RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error
 }
 
 type systemDatabase struct {
@@ -237,4 +239,42 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
 	}
 
 	return &result, nil
+}
+
+type workflowOutputDBInput struct {
+	workflowID string
+	output     any // XXX This will be updated to reflect that other types than string can be recorded
+}
+
+func (s *systemDatabase) RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error {
+	query := `UPDATE dbos.workflow_status
+		SET output = $1, updated_at = $2, status = 'SUCCESS'
+		WHERE workflow_uuid = $3`
+
+	fmt.Println("Recording workflow output:", input)
+	_, err := s.pool.Exec(ctx, query, input.output.(string), time.Now().UnixMilli(), input.workflowID)
+	if err != nil {
+		return fmt.Errorf("failed to record workflow output: %w", err)
+	}
+
+	return nil
+}
+
+type workflowErrorDBInput struct {
+	workflowID string
+	err        error
+}
+
+func (s *systemDatabase) RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error {
+	query := `UPDATE dbos.workflow_status
+		SET error = $1, updated_at = $2, status = 'FAILED'
+		WHERE workflow_uuid = $3`
+
+	fmt.Println("Recording workflow error:", input.err)
+	_, execErr := s.pool.Exec(ctx, query, input.err.Error(), time.Now().UnixMilli(), input.workflowID)
+	if execErr != nil {
+		return fmt.Errorf("failed to record workflow error: %w", execErr)
+	}
+
+	return nil
 }

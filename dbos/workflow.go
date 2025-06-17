@@ -74,17 +74,29 @@ func WithWorkflow[P any, R any](name string, fn WorkflowFunc[P, R]) func(ctx con
 }
 
 func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) WorkflowHandle[R] {
-	// Generate an ID for the workflow if not provided
-	if params.WorkflowID == "" {
-		params.WorkflowID = uuid.New().String()
-	}
+	// First, create a context for the workflow
+	dbosWorkflowContext := context.Background()
 
-	// Compute the deadline
+	// Compute the context deadline if any
 	var deadline time.Time
 	if params.Timeout > 0 {
 		deadline = time.Now().Add(params.Timeout)
 	} else if !params.Deadline.IsZero() {
 		deadline = params.Deadline
+	}
+
+	var workflowCancelFunction context.CancelFunc
+	if params.Timeout > 0 {
+		dbosWorkflowContext, workflowCancelFunction = context.WithTimeout(dbosWorkflowContext, params.Timeout)
+		defer workflowCancelFunction() // Ensure the context is cancelled to free resources
+	} else if !params.Deadline.IsZero() {
+		dbosWorkflowContext, workflowCancelFunction = context.WithDeadline(dbosWorkflowContext, params.Deadline)
+		defer workflowCancelFunction() // Ensure the context is cancelled to free resources
+	}
+
+	// Generate an ID for the workflow if not provided
+	if params.WorkflowID == "" {
+		params.WorkflowID = uuid.New().String()
 	}
 
 	workflowStatus := WorkflowStatus{
@@ -95,8 +107,9 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	}
 
 	// Init status // TODO: implement init status validation
-	_, err := getExecutor().systemDB.InsertWorkflowStatus(ctx, workflowStatus)
+	_, err := getExecutor().systemDB.InsertWorkflowStatus(dbosWorkflowContext, workflowStatus)
 	if err != nil {
+		// TODO handle errors properly
 		panic("failed to insert workflow status: " + err.Error())
 	}
 
@@ -107,53 +120,57 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	errorChan := make(chan error, 1)
 
 	// Create the handle
-	userFunctionContext := ctx
-	var userFunctionCancel context.CancelFunc
-	if params.Timeout > 0 {
-		userFunctionContext, userFunctionCancel = context.WithTimeout(ctx, params.Timeout)
-		defer userFunctionCancel() // Ensure the context is cancelled to free resources
-	} else if !params.Deadline.IsZero() {
-		userFunctionContext, userFunctionCancel = context.WithDeadline(ctx, params.Deadline)
-		defer userFunctionCancel() // Ensure the context is cancelled to free resources
-	}
 	handle := &workflowHandle[R]{
 		resultChan: resultChan,
 		errorChan:  errorChan,
-		ctx:        userFunctionContext,
+		ctx:        dbosWorkflowContext,
 	}
 
 	// Run the function in a goroutine
 	go func() {
-		defer func() {
-			// Avoid crashing the application if the workflow function panics
-			if r := recover(); r != nil {
-				errorChan <- fmt.Errorf("workflow function panicked: %v", r)
-			}
-		}()
 		result, err := fn(ctx, input)
 		if err != nil {
+			fmt.Println("workflow function returned an error:", err)
+			recordErr := getExecutor().systemDB.RecordWorkflowError(dbosWorkflowContext, workflowErrorDBInput{workflowID: workflowStatus.ID, err: err})
+			if recordErr != nil {
+				// TODO: make sure to return both errors
+				fmt.Println("recording workflow error:", recordErr)
+				errorChan <- recordErr
+				return
+			}
 			errorChan <- err
 		} else {
+			recordErr := getExecutor().systemDB.RecordWorkflowOutput(dbosWorkflowContext, workflowOutputDBInput{workflowID: workflowStatus.ID, output: result})
+			if recordErr != nil {
+				fmt.Println("recording workflow output:", recordErr)
+				// We cannot return the user code result because we failed to record the output
+				errorChan <- recordErr
+				return
+			}
 			resultChan <- result
 		}
 	}()
 
 	// Run the peer goroutine to handle cancellation and timeout
-	go func() {
-		select {
-		case result := <-resultChan:
-			// Record the result
-			return
-		case err := <-errorChan:
-			// Record error
-			return
-		case <-userFunctionContext.Done():
-			// the context was cancelled or timed out
-			// Record timeout or cancellation
-			return
+	if dbosWorkflowContext.Done() != nil {
+		fmt.Println("starting goroutine to handle workflow context cancellation or timeout")
+		go func() {
+			select {
+			case <-dbosWorkflowContext.Done():
+				// The context was cancelled or timed out: record timeout or cancellation
+				timeoutErr := dbosWorkflowContext.Err()
+				err := getExecutor().systemDB.RecordWorkflowError(dbosWorkflowContext, workflowErrorDBInput{
+					workflowID: workflowStatus.ID,
+					err:        timeoutErr,
+				})
+				if err != nil {
+					fmt.Println("failed to record workflow error:", err)
+				}
+				return
+			}
+		}()
+	}
 
-		}
-	}()
-
+	fmt.Println("Returning workflow handle for workflow ID:", params.WorkflowID)
 	return handle
 }
