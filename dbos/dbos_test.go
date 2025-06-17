@@ -8,8 +8,8 @@ import (
 )
 
 var (
-	w1 = WithWorkflow("userFunc1", userFunc1)
-	s1 = WithStep("userStep1", userStep1)
+	w1 = WithWorkflow(userFunc1)
+	s1 = WithStep(userStep1)
 )
 
 func userFunc1(ctx context.Context, input string) (string, error) {
