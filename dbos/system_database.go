@@ -20,6 +20,7 @@ type SystemDatabase interface {
 	InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error)
 	RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error
 	RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error
+	RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error
 }
 
 type systemDatabase struct {
@@ -137,6 +138,7 @@ func NewSystemDatabase() (SystemDatabase, error) {
 }
 
 func (s *systemDatabase) Destroy() error {
+	fmt.Println("Closing system database connection pool")
 	s.pool.Close()
 	return nil
 }
@@ -241,6 +243,7 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
 	return &result, nil
 }
 
+// FIXME: merge in a single function that knows whether to set error or output
 type workflowOutputDBInput struct {
 	workflowID string
 	output     any // XXX This will be updated to reflect that other types than string can be recorded
@@ -274,6 +277,54 @@ func (s *systemDatabase) RecordWorkflowError(ctx context.Context, input workflow
 	_, execErr := s.pool.Exec(ctx, query, input.err.Error(), time.Now().UnixMilli(), input.workflowID)
 	if execErr != nil {
 		return fmt.Errorf("failed to record workflow error: %w", execErr)
+	}
+
+	return nil
+}
+
+type recordOperationResultDBInput struct {
+	workflowID    string
+	operationID   int
+	operationName string
+	output        any
+	err           error
+}
+
+func (s *systemDatabase) RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error {
+	var query string
+	query = `INSERT INTO dbos.operation_outputs
+            (workflow_uuid, function_id, output, error, function_name)
+            VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT DO NOTHING`
+
+	var errorString *string
+	if input.err != nil {
+		e := input.err.Error()
+		errorString = &e
+	}
+
+	commandTag, err := s.pool.Exec(ctx, query,
+		input.workflowID,
+		input.operationID,
+		input.output,
+		errorString,
+		input.operationName,
+	)
+
+	/*
+		fmt.Printf("RecordOperationResult - CommandTag: %v\n", commandTag)
+		fmt.Printf("RecordOperationResult - Rows affected: %d\n", commandTag.RowsAffected())
+		fmt.Printf("RecordOperationResult - SQL: %s\n", commandTag.String())
+	*/
+
+	// TODO handle serialization errors
+	if err != nil {
+		fmt.Printf("RecordOperationResult - Error occurred: %v\n", err)
+		return fmt.Errorf("failed to record operation result: %w", err)
+	}
+
+	if commandTag.RowsAffected() == 0 {
+		fmt.Printf("RecordOperationResult - WARNING: No rows were affected by the insert\n")
 	}
 
 	return nil

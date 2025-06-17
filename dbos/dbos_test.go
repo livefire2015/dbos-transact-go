@@ -9,13 +9,17 @@ import (
 
 var (
 	w1 = WithWorkflow("userFunc1", userFunc1)
+	s1 = WithStep("userStep1", userStep1)
 )
 
 func userFunc1(ctx context.Context, input string) (string, error) {
-	if input == "no!" {
-		return "yes!", nil
-	}
-	return input, nil
+	fmt.Sprintf("I am a workflow: %s", input)
+	res, err := s1(ctx, StepParams{}, input)
+	return res, err
+}
+
+func userStep1(ctx context.Context, input string) (string, error) {
+	return fmt.Sprintf("I am a step: %s", input), nil
 }
 
 func TestTransact(t *testing.T) {
@@ -36,6 +40,7 @@ func TestTransact(t *testing.T) {
 	}
 
 	wf1Handle := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
+	fmt.Println("Workflow handle:", wf1Handle)
 	result, err := wf1Handle.GetResult()
 	fmt.Printf("Workflow result: %s, error: %v\n", result, err)
 }
