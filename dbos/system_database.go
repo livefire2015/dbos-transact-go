@@ -148,7 +148,7 @@ func (s *systemDatabase) Destroy() error {
 /*******************************/
 
 type InsertWorkflowResult struct {
-	Attempts                int    `json:"recovery_attempts"`
+	Attempts                int    `json:"attempts"`
 	Status                  string `json:"status"`
 	Name                    string `json:"name"`
 	ClassName               string `json:"class_name"`
@@ -189,7 +189,7 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
         application_version,
         application_id,
         created_at,
-        recovery_attempts,
+        attempts,
         updated_at,
         workflow_timeout_ms,
         workflow_deadline_epoch_ms,
@@ -199,10 +199,10 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
     ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
-            recovery_attempts = workflow_status.recovery_attempts + 1,
+            attempts = workflow_status.attempts + 1,
             updated_at = EXCLUDED.updated_at,
             executor_id = EXCLUDED.executor_id
-        RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, workflow_deadline_epoch_ms`
+        RETURNING attempts, status, name, class_name, config_name, queue_name, workflow_deadline_epoch_ms`
 
 	var result InsertWorkflowResult
 	err := s.pool.QueryRow(ctx, query,
