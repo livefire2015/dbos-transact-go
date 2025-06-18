@@ -28,23 +28,23 @@ type WorkflowStatus struct {
 	Status             WorkflowStatusType `json:"status"`
 	Name               string             `json:"name"`
 	AuthenticatedUser  *string            `json:"authenticated_user"`
-	AssumedRole        *string            `json:"assumed_role" db:"assumed_role"`
-	AuthenticatedRoles *string            `json:"authenticated_roles" db:"authenticated_roles"`
-	Output             any                `json:"output" db:"output"`
-	Error              error              `json:"error" db:"error"`
-	ExecutorID         *string            `json:"executor_id" db:"executor_id"`
-	CreatedAt          time.Time          `json:"created_at" db:"created_at"`
-	UpdatedAt          time.Time          `json:"updated_at" db:"updated_at"`
-	ApplicationVersion *string            `json:"application_version" db:"application_version"`
-	ApplicationID      *string            `json:"application_id" db:"application_id"`
-	Attempts           int                `json:"attempts" db:"attempts"`
-	QueueName          *string            `json:"queue_name" db:"queue_name"`
-	Timeout            time.Duration      `json:"-" db:"-"` // Converted to/from workflow_timeout_ms
-	Deadline           time.Time          `json:"-" db:"-"` // Converted to/from workflow_deadline_epoch_ms
-	StartedAt          time.Time          `json:"-" db:"-"` // Converted to/from started_at_epoch_ms
-	DeduplicationID    *string            `json:"deduplication_id" db:"deduplication_id"`
-	Input              any                `json:"-" db:"-"` // Converted to/from inputs
-	Priority           int                `json:"priority" db:"priority"`
+	AssumedRole        *string            `json:"assumed_role"`
+	AuthenticatedRoles *string            `json:"authenticated_roles"`
+	Output             any                `json:"output"`
+	Error              error              `json:"error"`
+	ExecutorID         *string            `json:"executor_id"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+	ApplicationVersion *string            `json:"application_version"`
+	ApplicationID      *string            `json:"application_id"`
+	Attempts           int                `json:"attempts"`
+	QueueName          *string            `json:"queue_name"`
+	Timeout            time.Duration      `json:"timeout"`
+	Deadline           time.Time          `json:"deadline"`
+	StartedAt          time.Time          `json:"started_at"`
+	DeduplicationID    *string            `json:"deduplication_id"`
+	Input              any                `json:"input"`
+	Priority           int                `json:"priority"`
 }
 
 // WorkflowState holds the runtime state for a workflow execution
