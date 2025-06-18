@@ -22,7 +22,6 @@ var (
 	simpleWf         = WithWorkflow(simpleWorkflow)
 	simpleWfError    = WithWorkflow(simpleWorkflowError)
 	simpleWfWithStep = WithWorkflow(simpleWorkflowWithStep)
-	simpleStp        = WithStep(simpleStep)
 	// struct methods
 	s              = workflowStruct{}
 	simpleWfStruct = WithWorkflow(s.simpleWorkflow)
@@ -48,7 +47,7 @@ func simpleWorkflowError(ctx context.Context, input string) (int, error) {
 }
 
 func simpleWorkflowWithStep(ctx context.Context, input string) (string, error) {
-	return simpleStp(ctx, StepParams{}, input)
+	return RunAsStep[string](ctx, StepParams{}, simpleStep, input)
 }
 
 func simpleStep(ctx context.Context, input string) (string, error) {
