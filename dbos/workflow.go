@@ -164,7 +164,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		result, err := fn(augmentUserContext, input)
 		if err != nil {
 			fmt.Println("workflow function returned an error:", err)
-			recordErr := getExecutor().systemDB.RecordWorkflowError(dbosWorkflowContext, workflowErrorDBInput{workflowID: workflowStatus.ID, err: err})
+			recordErr := getExecutor().systemDB.UpdateWorkflowOutcome(dbosWorkflowContext, UpdateWorkflowOutcomeDBInput{workflowID: workflowStatus.ID, status: WorkflowStatusError, err: err})
 			if recordErr != nil {
 				// TODO: make sure to return both errors
 				errorChan <- recordErr
@@ -172,7 +172,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 			}
 			errorChan <- err
 		} else {
-			recordErr := getExecutor().systemDB.RecordWorkflowOutput(dbosWorkflowContext, workflowOutputDBInput{workflowID: workflowStatus.ID, output: result})
+			recordErr := getExecutor().systemDB.UpdateWorkflowOutcome(dbosWorkflowContext, UpdateWorkflowOutcomeDBInput{workflowID: workflowStatus.ID, status: WorkflowStatusSuccess, output: result})
 			if recordErr != nil {
 				// We cannot return the user code result because we failed to record the output
 				errorChan <- recordErr

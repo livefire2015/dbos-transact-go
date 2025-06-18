@@ -12,7 +12,6 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -23,10 +22,9 @@ import (
 type SystemDatabase interface {
 	Destroy()
 	InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error)
-	RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error
-	RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error
 	RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error
 	ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) ([]WorkflowStatus, error)
+	UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowOutcomeDBInput) error
 }
 
 type systemDatabase struct {
@@ -252,43 +250,6 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
 	return &result, nil
 }
 
-// FIXME: merge in a single function that knows whether to set error or output
-type workflowOutputDBInput struct {
-	workflowID string
-	output     any // XXX This will be updated to reflect that other types than string can be recorded
-}
-
-func (s *systemDatabase) RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error {
-	updateInput := UpdateWorkflowStatusDBInput{
-		WorkflowID: input.workflowID,
-		Status:     "SUCCESS",
-		Options: UpdateWorkflowStatusOptions{
-			Update: &UpdateWorkflowStatusUpdate{
-				Output: input.output,
-			},
-		},
-	}
-	return s.UpdateWorkflowStatus(ctx, updateInput)
-}
-
-type workflowErrorDBInput struct {
-	workflowID string
-	err        error
-}
-
-func (s *systemDatabase) RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error {
-	updateInput := UpdateWorkflowStatusDBInput{
-		WorkflowID: input.workflowID,
-		Status:     "ERROR",
-		Options: UpdateWorkflowStatusOptions{
-			Update: &UpdateWorkflowStatusUpdate{
-				Error: input.err,
-			},
-		},
-	}
-	return s.UpdateWorkflowStatus(ctx, updateInput)
-}
-
 type recordOperationResultDBInput struct {
 	workflowID    string
 	operationID   int
@@ -487,96 +448,39 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	return workflows, nil
 }
 
-type UpdateWorkflowStatusDBInput struct {
-	WorkflowID string
-	Status     string
-	Options    UpdateWorkflowStatusOptions
+type UpdateWorkflowOutcomeDBInput struct {
+	workflowID string
+	status     WorkflowStatusType
+	output     any
+	err        error
+	tx         pgx.Tx
 }
 
-type UpdateWorkflowStatusOptions struct {
-	Update         *UpdateWorkflowStatusUpdate
-	Where          *UpdateWorkflowStatusWhere
-	ThrowOnFailure *bool
-	Tx             pgx.Tx
-}
+// Will evolve as we serialize all output and error types
+func (s *systemDatabase) UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowOutcomeDBInput) error {
+	query := `UPDATE dbos.workflow_status
+			  SET status = $1, output = $2, error = $3, updated_at = $4, deduplication_id = NULL
+			  WHERE workflow_uuid = $5`
 
-type UpdateWorkflowStatusUpdate struct {
-	Output                any
-	Error                 error
-	ResetRecoveryAttempts bool
-	QueueName             *string
-	ResetDeadline         bool
-	ResetDeduplicationID  bool
-	ResetStartedAtEpochMs bool
-}
-
-type UpdateWorkflowStatusWhere struct {
-	Status *string
-}
-
-func (s *systemDatabase) UpdateWorkflowStatus(ctx context.Context, input UpdateWorkflowStatusDBInput) error {
-	qb := newQueryBuilder()
-
-	// Always set these
-	qb.addSet("status", input.Status)
-	qb.addSet("updated_at", time.Now().UnixMilli())
-	qb.addWhere("workflow_uuid", input.WorkflowID)
-
-	// Handle update options
-	if update := input.Options.Update; update != nil {
-		if update.Output != nil {
-			qb.addSet("output", update.Output.(string))
-		}
-		if update.Error != nil {
-			qb.addSet("error", update.Error.Error())
-		}
-		if update.ResetRecoveryAttempts {
-			qb.addSetRaw("recovery_attempts = 0")
-		}
-		if update.ResetDeadline {
-			qb.addSetRaw("workflow_deadline_epoch_ms = NULL")
-		}
-		if update.QueueName != nil {
-			qb.addSet("queue_name", *update.QueueName)
-		}
-		if update.ResetDeduplicationID {
-			qb.addSetRaw("deduplication_id = NULL")
-		}
-		if update.ResetStartedAtEpochMs {
-			qb.addSetRaw("started_at_epoch_ms = NULL")
-		}
+	outputStr := "NULL"
+	if input.output != nil {
+		outputStr = fmt.Sprintf("%v", input.output)
+	}
+	errorStr := "NULL"
+	if input.err != nil {
+		errorStr = input.err.Error()
 	}
 
-	// Handle where options
-	if where := input.Options.Where; where != nil && where.Status != nil {
-		qb.addWhere("status", *where.Status)
-	}
-
-	// Build and execute query
-	query := fmt.Sprintf("UPDATE dbos.workflow_status SET %s WHERE %s",
-		strings.Join(qb.setClauses, ", "),
-		strings.Join(qb.whereClauses, " AND "))
-
-	// Execute the query using transaction if provided, otherwise use connection pool
-	var commandTag pgconn.CommandTag
 	var err error
-
-	if input.Options.Tx != nil {
-		commandTag, err = input.Options.Tx.Exec(ctx, query, qb.args...)
+	if input.tx != nil {
+		_, err = input.tx.Exec(ctx, query, input.status, outputStr, errorStr, time.Now().UnixMilli(), input.workflowID)
 	} else {
-		commandTag, err = s.pool.Exec(ctx, query, qb.args...)
+		_, err = s.pool.Exec(ctx, query, input.status, outputStr, errorStr, time.Now().UnixMilli(), input.workflowID)
 	}
 
 	if err != nil {
 		return fmt.Errorf("failed to update workflow status: %w", err)
 	}
-
-	// Check if update was successful
-	throwOnFailure := input.Options.ThrowOnFailure == nil || *input.Options.ThrowOnFailure
-	if throwOnFailure && commandTag.RowsAffected() != 1 {
-		return fmt.Errorf("attempt to record transition of nonexistent workflow %s", input.WorkflowID)
-	}
-
 	return nil
 }
 
@@ -610,21 +514,14 @@ func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) 
 		return nil
 	}
 
-	updateInput := UpdateWorkflowStatusDBInput{
-		WorkflowID: workflowID,
-		Status:     "CANCELLED",
-		Options: UpdateWorkflowStatusOptions{
-			Update: &UpdateWorkflowStatusUpdate{
-				QueueName:             nil,
-				ResetDeduplicationID:  true,
-				ResetStartedAtEpochMs: true,
-			},
-			Tx: tx,
-		},
-	}
+	//Set the workflow's status to CANCELLED
+	updateStatusQuery := `UPDATE dbos.workflow_status
+						  SET status = 'CANCELLED', updated_at = $1
+						  WHERE workflow_uuid = $2`
 
-	if err := s.UpdateWorkflowStatus(ctx, updateInput); err != nil {
-		return err
+	_, err = tx.Exec(ctx, updateStatusQuery, time.Now().UnixMilli(), workflowID)
+	if err != nil {
+		return fmt.Errorf("failed to update workflow status to CANCELLED: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
