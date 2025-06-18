@@ -295,10 +295,19 @@ func callFunction(fn any, args ...any) ([]any, error) {
 		return nil, fmt.Errorf("function expects %d arguments, got %d", fnType.NumIn(), len(args))
 	}
 
-	// Convert arguments to reflect.Value
+	// Convert arguments to reflect.Value and validate types
 	argValues := make([]reflect.Value, len(args))
 	for i, arg := range args {
-		argValues[i] = reflect.ValueOf(arg)
+		argValue := reflect.ValueOf(arg)
+		expectedType := fnType.In(i)
+
+		// Check if the argument type is assignable to the expected parameter type
+		if !argValue.Type().AssignableTo(expectedType) {
+			return nil, fmt.Errorf("argument %d: expected type %s, got %s",
+				i, expectedType.String(), argValue.Type().String())
+		}
+
+		argValues[i] = argValue
 	}
 
 	// Call the function
