@@ -27,8 +27,10 @@ var (
 	simpleWfStruct = WithWorkflow(s.simpleWorkflow)
 	simpleWfValue  = WithWorkflow(s.simpleWorkflowValue)
 	// interface method workflow
-	workflowIface WorkflowInterface = &workflowImplementation{}
-	simpleWfIface                   = WithWorkflow(workflowIface.Execute)
+	workflowIface WorkflowInterface = &workflowImplementation{
+		field: "example",
+	}
+	simpleWfIface = WithWorkflow(workflowIface.Execute)
 	// Generic workflow
 	wfInt = WithWorkflow(Identity[string]) // FIXME make this an int eventually
 	// Closure with captured state
@@ -72,10 +74,12 @@ type WorkflowInterface interface {
 	Execute(ctx context.Context, input string) (string, error)
 }
 
-type workflowImplementation struct{}
+type workflowImplementation struct {
+	field string
+}
 
 func (w *workflowImplementation) Execute(ctx context.Context, input string) (string, error) {
-	return input + "-interface", nil
+	return input + "-" + w.field + "-interface", nil
 }
 
 // Generic workflow function
@@ -198,7 +202,7 @@ func TestWorkflowsWrapping(t *testing.T) {
 				return handle.GetResult()
 			},
 			input:          "echo",
-			expectedResult: "echo-interface",
+			expectedResult: "echo-example-interface",
 			expectError:    false,
 		},
 		{
