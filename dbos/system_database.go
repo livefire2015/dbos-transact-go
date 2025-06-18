@@ -16,7 +16,7 @@ import (
 )
 
 type SystemDatabase interface {
-	Destroy() error
+	Destroy()
 	InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error)
 	RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error
 	RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error
@@ -138,10 +138,9 @@ func NewSystemDatabase() (SystemDatabase, error) {
 	}, nil
 }
 
-func (s *systemDatabase) Destroy() error {
+func (s *systemDatabase) Destroy() {
 	fmt.Println("Closing system database connection pool")
 	s.pool.Close()
-	return nil
 }
 
 /*******************************/
@@ -149,13 +148,11 @@ func (s *systemDatabase) Destroy() error {
 /*******************************/
 
 type InsertWorkflowResult struct {
-	Attempts                int    `json:"attempts"`
-	Status                  string `json:"status"`
-	Name                    string `json:"name"`
-	ClassName               string `json:"class_name"`
-	ConfigName              string `json:"config_name"`
-	QueueName               string `json:"queue_name"`
-	WorkflowDeadlineEpochMs *int64 `json:"workflow_deadline_epoch_ms"`
+	Attempts                int     `json:"attempts"`
+	Status                  string  `json:"status"`
+	Name                    string  `json:"name"`
+	QueueName               *string `json:"queue_name"`
+	WorkflowDeadlineEpochMs *int64  `json:"workflow_deadline_epoch_ms"`
 }
 
 func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error) {
@@ -261,7 +258,6 @@ func (s *systemDatabase) RecordWorkflowOutput(ctx context.Context, input workflo
 		SET output = $1, updated_at = $2, status = 'SUCCESS'
 		WHERE workflow_uuid = $3`
 
-	fmt.Println("Recording workflow output:", input)
 	_, err := s.pool.Exec(ctx, query, input.output.(string), time.Now().UnixMilli(), input.workflowID)
 	if err != nil {
 		return fmt.Errorf("failed to record workflow output: %w", err)
@@ -280,7 +276,6 @@ func (s *systemDatabase) RecordWorkflowError(ctx context.Context, input workflow
 		SET error = $1, updated_at = $2, status = 'FAILED'
 		WHERE workflow_uuid = $3`
 
-	fmt.Println("Recording workflow error:", input.err)
 	_, execErr := s.pool.Exec(ctx, query, input.err.Error(), time.Now().UnixMilli(), input.workflowID)
 	if execErr != nil {
 		return fmt.Errorf("failed to record workflow error: %w", execErr)

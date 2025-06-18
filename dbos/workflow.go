@@ -114,6 +114,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		Timeout:       params.Timeout,
 		Input:         input,
 		ApplicationID: nil, // TODO: set application ID if available
+		QueueName:     nil, // TODO: set queue name if available
 	}
 
 	// Init status // TODO: implement init status validation
@@ -151,7 +152,6 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 			recordErr := getExecutor().systemDB.RecordWorkflowError(dbosWorkflowContext, workflowErrorDBInput{workflowID: workflowStatus.ID, err: err})
 			if recordErr != nil {
 				// TODO: make sure to return both errors
-				fmt.Println("recording workflow error:", recordErr)
 				errorChan <- recordErr
 				return
 			}
@@ -159,7 +159,6 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		} else {
 			recordErr := getExecutor().systemDB.RecordWorkflowOutput(dbosWorkflowContext, workflowOutputDBInput{workflowID: workflowStatus.ID, output: result})
 			if recordErr != nil {
-				fmt.Println("recording workflow output:", recordErr)
 				// We cannot return the user code result because we failed to record the output
 				errorChan <- recordErr
 				return
@@ -183,7 +182,6 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		}
 	*/
 
-	fmt.Println("Returning workflow handle for workflow ID:", params.WorkflowID)
 	return handle, nil
 }
 
@@ -198,6 +196,7 @@ type StepParams struct {
 	BackoffRate int
 }
 
+// XXX do we even need to register steps??
 func WithStep[P any, R any](fn StepFunc[P, R]) func(ctx context.Context, params StepParams, input P) (R, error) {
 	// TODO : name can be found using reflection. Must be FQDN.
 	registerWorkflow(fn)

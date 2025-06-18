@@ -24,25 +24,37 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 var (
-	w1 = WithWorkflow(userFunc1)
-	s1 = WithStep(userStep1)
+	simpleWf         = WithWorkflow(simpleWorkflow)
+	simpleWfError    = WithWorkflow(simpleWorkflowError)
+	simpleWfWithStep = WithWorkflow(simpleWorkflowWithStep)
+	simpleStp        = WithStep(simpleStep)
 )
 
-func userFunc1(ctx context.Context, input string) (string, error) {
-	fmt.Sprintf("I am a workflow: %s", input)
-	res, err := s1(ctx, StepParams{}, input)
+func simpleWorkflow(ctxt context.Context, input string) (string, error) {
+	return input, nil
+}
+
+func simpleWorkflowError(ctx context.Context, input string) (int, error) {
+	return 0, fmt.Errorf("failure")
+}
+
+func simpleWorkflowWithStep(ctx context.Context, input string) (string, error) {
+	res, err := simpleStp(ctx, StepParams{}, input)
 	return res, err
 }
 
-func userStep1(ctx context.Context, input string) (string, error) {
-	return fmt.Sprintf("I am a step: %s", input), nil
+func simpleStep(ctx context.Context, input string) (string, error) {
+	return "from step", nil
 }
 
-func TestTransact(t *testing.T) {
-	fmt.Println(registry)
+func setupDBOS(t *testing.T) {
+	t.Helper()
+
 	databaseURL := os.Getenv("DBOS_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("DBOS_DATABASE_URL not set, skipping integration test")
@@ -52,26 +64,70 @@ func TestTransact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create DBOS instance: %v", err)
 	}
-	defer Destroy()
 
 	if dbos == nil {
 		t.Fatal("expected DBOS instance but got nil")
 	}
 
-	wf1Handle, err := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
+	// Register cleanup to run after test completes
+	t.Cleanup(func() {
+		Destroy()
+	})
+}
+func TestSimpleWorflow(t *testing.T) {
+	setupDBOS(t)
+
+	handle, err := simpleWf(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, "echo")
 	if err != nil {
 		t.Fatalf("failed to run workflow: %v", err)
 	}
-	fmt.Println("Workflow handle:", wf1Handle)
-	result, err := wf1Handle.GetResult()
-	fmt.Printf("Workflow result: %s, error: %v\n", result, err)
-
-	// Check list workflows
-	wfList, err := dbos.systemDB.ListWorkflows(context.Background(), ListWorkflowsDBInput{})
+	result, err := handle.GetResult()
 	if err != nil {
-		t.Fatalf("failed to list workflows: %v", err)
+		t.Fatal("expected no error")
 	}
-	for _, wf := range wfList {
-		fmt.Printf("Workflow ID: %s, Status: %s\n", wf.ID, wf.Status)
+	if result != "echo" {
+		t.Fatalf("unexpected return %s", result)
 	}
 }
+func TestSimpleWorflowError(t *testing.T) {
+	setupDBOS(t)
+
+	handle, err := simpleWfError(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, "echo")
+	if err != nil {
+		t.Fatalf("failed to run workflow: %v", err)
+	}
+	_, err = handle.GetResult()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err.Error() != "failure" {
+		t.Fatalf("unexpected error %s", err.Error())
+	}
+}
+
+func TestSimpleWorflowWithStep(t *testing.T) {
+	setupDBOS(t)
+
+	handle, err := simpleWfWithStep(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, "echo")
+	if err != nil {
+		t.Fatalf("failed to run workflow: %v", err)
+	}
+	result, err := handle.GetResult()
+	if err != nil {
+		t.Fatal("expected no error")
+	}
+	if result != "from step" {
+		t.Fatalf("unexpected return %s", result)
+	}
+}
+
+/*
+// Check list workflows
+wfList, err := dbos.systemDB.ListWorkflows(context.Background(), ListWorkflowsDBInput{})
+if err != nil {
+	t.Fatalf("failed to list workflows: %v", err)
+}
+for _, wf := range wfList {
+	fmt.Printf("Workflow ID: %s, Status: %s\n", wf.ID, wf.Status)
+}
+*/
