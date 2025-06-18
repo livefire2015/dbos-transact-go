@@ -33,6 +33,8 @@ var (
 	simpleWfError    = WithWorkflow(simpleWorkflowError)
 	simpleWfWithStep = WithWorkflow(simpleWorkflowWithStep)
 	simpleStp        = WithStep(simpleStep)
+	s                = workflowStruct{}
+	simpleWfStruct   = WithWorkflow(s.simpleWorkflow)
 )
 
 func simpleWorkflow(ctxt context.Context, input string) (string, error) {
@@ -44,12 +46,17 @@ func simpleWorkflowError(ctx context.Context, input string) (int, error) {
 }
 
 func simpleWorkflowWithStep(ctx context.Context, input string) (string, error) {
-	res, err := simpleStp(ctx, StepParams{}, input)
-	return res, err
+	return simpleStp(ctx, StepParams{}, input)
 }
 
 func simpleStep(ctx context.Context, input string) (string, error) {
 	return "from step", nil
+}
+
+type workflowStruct struct{}
+
+func (i *workflowStruct) simpleWorkflow(ctx context.Context, input string) (string, error) {
+	return simpleWorkflow(ctx, input)
 }
 
 func setupDBOS(t *testing.T) {
@@ -117,6 +124,22 @@ func TestSimpleWorflowWithStep(t *testing.T) {
 		t.Fatal("expected no error")
 	}
 	if result != "from step" {
+		t.Fatalf("unexpected return %s", result)
+	}
+}
+
+func TestSimpleWorflowStruct(t *testing.T) {
+	setupDBOS(t)
+
+	handle, err := simpleWfStruct(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, "echo")
+	if err != nil {
+		t.Fatalf("failed to run workflow: %v", err)
+	}
+	result, err := handle.GetResult()
+	if err != nil {
+		t.Fatal("expected no error")
+	}
+	if result != "echo" {
 		t.Fatalf("unexpected return %s", result)
 	}
 }
