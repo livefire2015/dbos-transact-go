@@ -2,21 +2,11 @@ package dbos
 
 /**
 This suite tests high level DBOS features:
-	- Calling workflows
-		* Simple functions
-		* Struct members
-		* (all variations of "what can be workflow function")
-		* With steps (and all their variations)
-		* With child workflows (and all their variations)
-	- Workflow handles
-		* get result
-		* get status
-		* get wf ID
-Specialized workflow features:
-	- idempotency
-	- timeout
-	- deadlines
-
+	[x] Wrapping various golang methods in DBODS workflows
+	[] Workflow handles
+	[] wf idempotency
+	[] wf timeout
+	[] wf deadlines
 */
 
 import (
@@ -33,8 +23,20 @@ var (
 	simpleWfError    = WithWorkflow(simpleWorkflowError)
 	simpleWfWithStep = WithWorkflow(simpleWorkflowWithStep)
 	simpleStp        = WithStep(simpleStep)
-	s                = workflowStruct{}
-	simpleWfStruct   = WithWorkflow(s.simpleWorkflow)
+	// struct methods
+	s              = workflowStruct{}
+	simpleWfStruct = WithWorkflow(s.simpleWorkflow)
+	simpleWfValue  = WithWorkflow(s.simpleWorkflowValue)
+	// interface method workflow
+	workflowIface WorkflowInterface = &workflowImplementation{}
+	simpleWfIface                   = WithWorkflow(workflowIface.Execute)
+	// Generic workflow
+	wfInt = WithWorkflow(Identity[string]) // FIXME make this an int eventually
+	// Closure with captured state
+	prefix  = "hello-"
+	wfClose = WithWorkflow(func(ctx context.Context, in string) (string, error) {
+		return prefix + in, nil
+	})
 )
 
 func simpleWorkflow(ctxt context.Context, input string) (string, error) {
@@ -53,10 +55,33 @@ func simpleStep(ctx context.Context, input string) (string, error) {
 	return "from step", nil
 }
 
+// Unified struct that demonstrates both pointer and value receiver methods
 type workflowStruct struct{}
 
-func (i *workflowStruct) simpleWorkflow(ctx context.Context, input string) (string, error) {
+// Pointer receiver method
+func (w *workflowStruct) simpleWorkflow(ctx context.Context, input string) (string, error) {
 	return simpleWorkflow(ctx, input)
+}
+
+// Value receiver method on the same struct
+func (w workflowStruct) simpleWorkflowValue(ctx context.Context, input string) (string, error) {
+	return input + "-value", nil
+}
+
+// interface for workflow methods
+type WorkflowInterface interface {
+	Execute(ctx context.Context, input string) (string, error)
+}
+
+type workflowImplementation struct{}
+
+func (w *workflowImplementation) Execute(ctx context.Context, input string) (string, error) {
+	return input + "-interface", nil
+}
+
+// Generic workflow function
+func Identity[T any](ctx context.Context, in T) (T, error) {
+	return in, nil
 }
 
 func setupDBOS(t *testing.T) {
@@ -81,66 +106,163 @@ func setupDBOS(t *testing.T) {
 		Destroy()
 	})
 }
-func TestSimpleWorflow(t *testing.T) {
+func TestWorkflowsWrapping(t *testing.T) {
 	setupDBOS(t)
 
-	handle, err := simpleWf(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, "echo")
-	if err != nil {
-		t.Fatalf("failed to run workflow: %v", err)
+	type testCase struct {
+		name           string
+		workflowFunc   func(context.Context, WorkflowParams, string) (any, error)
+		input          string
+		expectedResult any
+		expectError    bool
+		expectedError  string
 	}
-	result, err := handle.GetResult()
-	if err != nil {
-		t.Fatal("expected no error")
-	}
-	if result != "echo" {
-		t.Fatalf("unexpected return %s", result)
-	}
-}
-func TestSimpleWorflowError(t *testing.T) {
-	setupDBOS(t)
 
-	handle, err := simpleWfError(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, "echo")
-	if err != nil {
-		t.Fatalf("failed to run workflow: %v", err)
+	tests := []testCase{
+		{
+			name: "SimpleWorkflow",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := simpleWf(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "echo",
+			expectedResult: "echo",
+			expectError:    false,
+		},
+		{
+			name: "SimpleWorkflowError",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := simpleWfError(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:         "echo",
+			expectError:   true,
+			expectedError: "failure",
+		},
+		{
+			name: "SimpleWorkflowWithStep",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := simpleWfWithStep(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "echo",
+			expectedResult: "from step",
+			expectError:    false,
+		},
+		{
+			name: "SimpleWorkflowStruct",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := simpleWfStruct(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "echo",
+			expectedResult: "echo",
+			expectError:    false,
+		},
+		{
+			name: "ValueReceiverWorkflow",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := simpleWfValue(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "echo",
+			expectedResult: "echo-value",
+			expectError:    false,
+		},
+		{
+			name: "interfaceMethodWorkflow",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := simpleWfIface(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "echo",
+			expectedResult: "echo-interface",
+			expectError:    false,
+		},
+		{
+			name: "GenericWorkflow",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				// For generic workflow, we need to convert string to int for testing
+				handle, err := wfInt(ctx, params, "42") // FIXME for now this returns a string because sys db accepts this
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "42", // input not used in this case
+			expectedResult: "42", // FIXME make this an int eventually
+			expectError:    false,
+		},
+		{
+			name: "ClosureWithCapturedState",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := wfClose(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "world",
+			expectedResult: "hello-world",
+			expectError:    false,
+		},
+		{
+			name: "AnonymousClosure",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				// Create anonymous closure workflow directly in test
+				anonymousWf := WithWorkflow(func(ctx context.Context, in string) (string, error) {
+					return "anonymous-" + in, nil
+				})
+				handle, err := anonymousWf(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "test",
+			expectedResult: "anonymous-test",
+			expectError:    false,
+		},
 	}
-	_, err = handle.GetResult()
-	if err == nil {
-		t.Fatal("expected error")
-	}
-	if err.Error() != "failure" {
-		t.Fatalf("unexpected error %s", err.Error())
-	}
-}
 
-func TestSimpleWorflowWithStep(t *testing.T) {
-	setupDBOS(t)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := tc.workflowFunc(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, tc.input)
 
-	handle, err := simpleWfWithStep(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, "echo")
-	if err != nil {
-		t.Fatalf("failed to run workflow: %v", err)
-	}
-	result, err := handle.GetResult()
-	if err != nil {
-		t.Fatal("expected no error")
-	}
-	if result != "from step" {
-		t.Fatalf("unexpected return %s", result)
-	}
-}
-
-func TestSimpleWorflowStruct(t *testing.T) {
-	setupDBOS(t)
-
-	handle, err := simpleWfStruct(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, "echo")
-	if err != nil {
-		t.Fatalf("failed to run workflow: %v", err)
-	}
-	result, err := handle.GetResult()
-	if err != nil {
-		t.Fatal("expected no error")
-	}
-	if result != "echo" {
-		t.Fatalf("unexpected return %s", result)
+			if tc.expectError {
+				if err == nil {
+					t.Fatal("expected error but got none")
+				}
+				if tc.expectedError != "" && err.Error() != tc.expectedError {
+					t.Fatalf("expected error %q but got %q", tc.expectedError, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected no error but got: %v", err)
+				}
+				if result != tc.expectedResult {
+					t.Fatalf("expected result %v but got %v", tc.expectedResult, result)
+				}
+			}
+		})
 	}
 }
 
