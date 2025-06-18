@@ -1,5 +1,24 @@
 package dbos
 
+/**
+This suite tests high level DBOS features:
+	- Calling workflows
+		* Simple functions
+		* Struct members
+		* (all variations of "what can be workflow function")
+		* With steps (and all their variations)
+		* With child workflows (and all their variations)
+	- Workflow handles
+		* get result
+		* get status
+		* get wf ID
+Specialized workflow features:
+	- idempotency
+	- timeout
+	- deadlines
+
+*/
+
 import (
 	"context"
 	"fmt"
@@ -8,14 +27,18 @@ import (
 )
 
 var (
-	w1 = WithWorkflow("userFunc1", userFunc1)
+	w1 = WithWorkflow(userFunc1)
+	s1 = WithStep(userStep1)
 )
 
 func userFunc1(ctx context.Context, input string) (string, error) {
-	if input == "no!" {
-		return "yes!", nil
-	}
-	return input, nil
+	fmt.Sprintf("I am a workflow: %s", input)
+	res, err := s1(ctx, StepParams{}, input)
+	return res, err
+}
+
+func userStep1(ctx context.Context, input string) (string, error) {
+	return fmt.Sprintf("I am a step: %s", input), nil
 }
 
 func TestTransact(t *testing.T) {
@@ -35,7 +58,20 @@ func TestTransact(t *testing.T) {
 		t.Fatal("expected DBOS instance but got nil")
 	}
 
-	wf1Handle := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
+	wf1Handle, err := w1(context.Background(), WorkflowParams{WorkflowID: "wf1id"}, "no!")
+	if err != nil {
+		t.Fatalf("failed to run workflow: %v", err)
+	}
+	fmt.Println("Workflow handle:", wf1Handle)
 	result, err := wf1Handle.GetResult()
 	fmt.Printf("Workflow result: %s, error: %v\n", result, err)
+
+	// Check list workflows
+	wfList, err := dbos.systemDB.ListWorkflows(context.Background(), ListWorkflowsDBInput{})
+	if err != nil {
+		t.Fatalf("failed to list workflows: %v", err)
+	}
+	for _, wf := range wfList {
+		fmt.Printf("Workflow ID: %s, Status: %s\n", wf.ID, wf.Status)
+	}
 }

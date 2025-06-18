@@ -2,6 +2,8 @@ package dbos
 
 import (
 	"fmt"
+	"reflect"
+	"runtime"
 	"sync"
 )
 
@@ -9,7 +11,8 @@ var registry = make(map[string]any)
 var regMutex sync.RWMutex
 
 // Register adds a workflow function to the registry (thread-safe, only once per name)
-func registerWorkflow(fqdn string, fn any) {
+func registerWorkflow(fn any) {
+	fqdn := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
 	regMutex.Lock()
 	defer regMutex.Unlock()
 

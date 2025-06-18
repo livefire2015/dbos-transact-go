@@ -18,6 +18,10 @@ import (
 type SystemDatabase interface {
 	Destroy() error
 	InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error)
+	RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error
+	RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error
+	RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error
+	ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) ([]WorkflowStatus, error)
 }
 
 type systemDatabase struct {
@@ -135,6 +139,7 @@ func NewSystemDatabase() (SystemDatabase, error) {
 }
 
 func (s *systemDatabase) Destroy() error {
+	fmt.Println("Closing system database connection pool")
 	s.pool.Close()
 	return nil
 }
@@ -144,7 +149,7 @@ func (s *systemDatabase) Destroy() error {
 /*******************************/
 
 type InsertWorkflowResult struct {
-	Attempts                int    `json:"recovery_attempts"`
+	Attempts                int    `json:"attempts"`
 	Status                  string `json:"status"`
 	Name                    string `json:"name"`
 	ClassName               string `json:"class_name"`
@@ -171,12 +176,22 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
 		deadline = &millis
 	}
 
+	var timeoutMs int64 = 0
+	if initStatus.Timeout > 0 {
+		timeoutMs = initStatus.Timeout.Milliseconds()
+	}
+
+	// TODO eventually handle any input type
+	// Convert input to string if it's not nil
+	var inputStr string
+	if initStatus.Input != nil {
+		inputStr = fmt.Sprintf("%v", initStatus.Input)
+	}
+
 	query := `INSERT INTO dbos.workflow_status (
         workflow_uuid,
         status,
         name,
-        class_name,
-        config_name,
         queue_name,
         authenticated_user,
         assumed_role,
@@ -185,51 +200,47 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
         application_version,
         application_id,
         created_at,
-        recovery_attempts,
+        attempts,
         updated_at,
         workflow_timeout_ms,
         workflow_deadline_epoch_ms,
         inputs,
         deduplication_id,
         priority
-    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+    ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
-            recovery_attempts = workflow_status.recovery_attempts + 1,
+            attempts = workflow_status.attempts + 1,
             updated_at = EXCLUDED.updated_at,
             executor_id = EXCLUDED.executor_id
-        RETURNING recovery_attempts, status, name, class_name, config_name, queue_name, workflow_deadline_epoch_ms`
+        RETURNING attempts, status, name, queue_name, workflow_deadline_epoch_ms`
 
 	var result InsertWorkflowResult
 	err := s.pool.QueryRow(ctx, query,
 		initStatus.ID,
 		initStatus.Status,
 		initStatus.Name,
-		"", // WorkflowClassName is not used in the query, so we pass an empty string
-		"", // WorkflowConfigName is not used in the query, so we pass an empty string
-		"", // initStatus.QueueName,
-		"", // initStatus.AuthenticatedUser,
-		"", // initStatus.AssumedRole,
-		"", // string(authenticatedRolesJSON),
+		initStatus.QueueName,
+		initStatus.AuthenticatedUser,
+		initStatus.AssumedRole,
+		initStatus.AuthenticatedRoles,
 		initStatus.ExecutorID,
 		initStatus.ApplicationVersion,
 		initStatus.ApplicationID,
 		initStatus.CreatedAt.UnixMilli(),
 		attempts,
 		updatedAt.UnixMilli(),
-		initStatus.Timeout.Milliseconds(),
+		timeoutMs,
 		deadline,
-		initStatus.Input,
-		"", // initStatus.DeduplicationID,
-		1,  // initStatus.Priority,
+		inputStr,
+		initStatus.DeduplicationID,
+		initStatus.Priority,
 	).Scan(
 		&result.Attempts,
 		&result.Status,
 		&result.Name,
-		&result.ClassName,
-		&result.ConfigName,
 		&result.QueueName,
-		&result.WorkflowDeadlineEpochMs, // We should convert this to a time.Time
+		&result.WorkflowDeadlineEpochMs,
 	)
 
 	if err != nil {
@@ -237,4 +248,248 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
 	}
 
 	return &result, nil
+}
+
+// FIXME: merge in a single function that knows whether to set error or output
+type workflowOutputDBInput struct {
+	workflowID string
+	output     any // XXX This will be updated to reflect that other types than string can be recorded
+}
+
+func (s *systemDatabase) RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error {
+	query := `UPDATE dbos.workflow_status
+		SET output = $1, updated_at = $2, status = 'SUCCESS'
+		WHERE workflow_uuid = $3`
+
+	fmt.Println("Recording workflow output:", input)
+	_, err := s.pool.Exec(ctx, query, input.output.(string), time.Now().UnixMilli(), input.workflowID)
+	if err != nil {
+		return fmt.Errorf("failed to record workflow output: %w", err)
+	}
+
+	return nil
+}
+
+type workflowErrorDBInput struct {
+	workflowID string
+	err        error
+}
+
+func (s *systemDatabase) RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error {
+	query := `UPDATE dbos.workflow_status
+		SET error = $1, updated_at = $2, status = 'FAILED'
+		WHERE workflow_uuid = $3`
+
+	fmt.Println("Recording workflow error:", input.err)
+	_, execErr := s.pool.Exec(ctx, query, input.err.Error(), time.Now().UnixMilli(), input.workflowID)
+	if execErr != nil {
+		return fmt.Errorf("failed to record workflow error: %w", execErr)
+	}
+
+	return nil
+}
+
+type recordOperationResultDBInput struct {
+	workflowID    string
+	operationID   int
+	operationName string
+	output        any
+	err           error
+}
+
+func (s *systemDatabase) RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error {
+	var query string
+	query = `INSERT INTO dbos.operation_outputs
+            (workflow_uuid, function_id, output, error, function_name)
+            VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT DO NOTHING`
+
+	var errorString *string
+	if input.err != nil {
+		e := input.err.Error()
+		errorString = &e
+	}
+
+	commandTag, err := s.pool.Exec(ctx, query,
+		input.workflowID,
+		input.operationID,
+		input.output,
+		errorString,
+		input.operationName,
+	)
+
+	/*
+		fmt.Printf("RecordOperationResult - CommandTag: %v\n", commandTag)
+		fmt.Printf("RecordOperationResult - Rows affected: %d\n", commandTag.RowsAffected())
+		fmt.Printf("RecordOperationResult - SQL: %s\n", commandTag.String())
+	*/
+
+	// TODO handle serialization errors
+	if err != nil {
+		fmt.Printf("RecordOperationResult - Error occurred: %v\n", err)
+		return fmt.Errorf("failed to record operation result: %w", err)
+	}
+
+	if commandTag.RowsAffected() == 0 {
+		fmt.Printf("RecordOperationResult - WARNING: No rows were affected by the insert\n")
+	}
+
+	return nil
+}
+
+// ListWorkflowsInput represents the input parameters for listing workflows
+type ListWorkflowsDBInput struct {
+	WorkflowName       *string
+	WorkflowIDPrefix   *string
+	WorkflowIDs        []string
+	AuthenticatedUser  *string
+	StartTime          time.Time
+	EndTime            time.Time
+	Status             *string
+	ApplicationVersion *string
+	Limit              *int
+	Offset             *int
+	SortDesc           bool
+}
+
+// ListWorkflows retrieves a list of workflows based on the provided filters
+func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) ([]WorkflowStatus, error) {
+	// Build the base query
+	query := `SELECT workflow_uuid, status, name, authenticated_user, assumed_role, authenticated_roles,
+	                 output, error, executor_id, created_at, updated_at, application_version, application_id,
+	                 attempts, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
+					 deduplication_id, inputs, priority
+	          FROM dbos.workflow_status WHERE 1=1`
+
+	var args []any
+	argCounter := 0
+
+	// Add filters
+	if input.WorkflowName != nil {
+		argCounter++
+		query += fmt.Sprintf(" AND name = $%d", argCounter)
+		args = append(args, *input.WorkflowName)
+	}
+
+	if input.WorkflowIDPrefix != nil {
+		argCounter++
+		query += fmt.Sprintf(" AND workflow_uuid LIKE $%d", argCounter)
+		args = append(args, *input.WorkflowIDPrefix+"%")
+	}
+
+	if input.WorkflowIDs != nil && len(input.WorkflowIDs) > 0 {
+		argCounter++
+		query += fmt.Sprintf(" AND workflow_uuid = ANY($%d)", argCounter)
+		args = append(args, input.WorkflowIDs)
+	}
+
+	if input.AuthenticatedUser != nil {
+		argCounter++
+		query += fmt.Sprintf(" AND authenticated_user = $%d", argCounter)
+		args = append(args, *input.AuthenticatedUser)
+	}
+
+	if !input.StartTime.IsZero() {
+		argCounter++
+		query += fmt.Sprintf(" AND created_at >= $%d", argCounter)
+		args = append(args, input.StartTime.UnixMilli())
+	}
+
+	if !input.EndTime.IsZero() {
+		argCounter++
+		query += fmt.Sprintf(" AND created_at <= $%d", argCounter)
+		args = append(args, input.EndTime.UnixMilli())
+	}
+
+	if input.Status != nil {
+		argCounter++
+		query += fmt.Sprintf(" AND status = $%d", argCounter)
+		args = append(args, *input.Status)
+	}
+
+	if input.ApplicationVersion != nil {
+		argCounter++
+		query += fmt.Sprintf(" AND application_version = $%d", argCounter)
+		args = append(args, *input.ApplicationVersion)
+	}
+
+	// Add sorting
+	if input.SortDesc {
+		query += " ORDER BY created_at DESC"
+	} else {
+		query += " ORDER BY created_at ASC"
+	}
+
+	// Add limit and offset
+	if input.Limit != nil {
+		argCounter++
+		query += fmt.Sprintf(" LIMIT $%d", argCounter)
+		args = append(args, *input.Limit)
+	}
+
+	if input.Offset != nil {
+		argCounter++
+		query += fmt.Sprintf(" OFFSET $%d", argCounter)
+		args = append(args, *input.Offset)
+	}
+
+	// Execute the query
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute ListWorkflows query: %w", err)
+	}
+	defer rows.Close()
+
+	var workflows []WorkflowStatus
+	for rows.Next() {
+		var wf WorkflowStatus
+		var createdAtMs, updatedAtMs int64
+		var timeoutMs *int64
+		var deadlineMs, startedAtMs *int64
+		var inputStr *string
+
+		err := rows.Scan(
+			&wf.ID, &wf.Status, &wf.Name, &wf.AuthenticatedUser, &wf.AssumedRole,
+			&wf.AuthenticatedRoles, &wf.Output, &wf.Error, &wf.ExecutorID, &createdAtMs,
+			&updatedAtMs, &wf.ApplicationVersion, &wf.ApplicationID,
+			&wf.Attempts, &wf.QueueName, &timeoutMs,
+			&deadlineMs, &startedAtMs, &wf.DeduplicationID,
+			&inputStr, &wf.Priority,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan workflow row: %w", err)
+		}
+
+		// Convert milliseconds to time.Time
+		wf.CreatedAt = time.Unix(0, createdAtMs*int64(time.Millisecond))
+		wf.UpdatedAt = time.Unix(0, updatedAtMs*int64(time.Millisecond))
+
+		// Convert timeout milliseconds to time.Duration
+		if timeoutMs != nil && *timeoutMs > 0 {
+			wf.Timeout = time.Duration(*timeoutMs) * time.Millisecond
+		}
+
+		// Convert deadline milliseconds to time.Time
+		if deadlineMs != nil {
+			wf.Deadline = time.Unix(0, *deadlineMs*int64(time.Millisecond))
+		}
+
+		// Convert started at milliseconds to time.Time
+		if startedAtMs != nil {
+			wf.StartedAt = time.Unix(0, *startedAtMs*int64(time.Millisecond))
+		}
+
+		// TODO: Convert inputStr back to proper type - for now just store as string
+		if inputStr != nil {
+			wf.Input = *inputStr
+		}
+
+		workflows = append(workflows, wf)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating over workflow rows: %w", err)
+	}
+
+	return workflows, nil
 }

@@ -9,19 +9,39 @@ import (
 )
 
 type WorkflowStatus struct {
-	Name               string
-	Status             string // TODO make an enum type
-	ID                 string
-	ExecutorID         string
-	ApplicationVersion *string
-	ApplicationID      string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-	Timeout            time.Duration
-	Deadline           time.Time // FIXME: maybe set this as an *int64 in milliseconds?
-	Input              any
-	Attempts           int
-	// Add remaining fields
+	ID                 string        `json:"workflow_uuid"`
+	Status             string        `json:"status"`
+	Name               string        `json:"name"`
+	AuthenticatedUser  *string       `json:"authenticated_user"`
+	AssumedRole        *string       `json:"assumed_role" db:"assumed_role"`
+	AuthenticatedRoles *string       `json:"authenticated_roles" db:"authenticated_roles"`
+	Output             any           `json:"output" db:"output"`
+	Error              error         `json:"error" db:"error"`
+	ExecutorID         *string       `json:"executor_id" db:"executor_id"`
+	CreatedAt          time.Time     `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time     `json:"updated_at" db:"updated_at"`
+	ApplicationVersion *string       `json:"application_version" db:"application_version"`
+	ApplicationID      *string       `json:"application_id" db:"application_id"`
+	Attempts           int           `json:"attempts" db:"attempts"`
+	QueueName          *string       `json:"queue_name" db:"queue_name"`
+	Timeout            time.Duration `json:"-" db:"-"` // Converted to/from workflow_timeout_ms
+	Deadline           time.Time     `json:"-" db:"-"` // Converted to/from workflow_deadline_epoch_ms
+	StartedAt          time.Time     `json:"-" db:"-"` // Converted to/from started_at_epoch_ms
+	DeduplicationID    *string       `json:"deduplication_id" db:"deduplication_id"`
+	Input              any           `json:"-" db:"-"` // Converted to/from inputs
+	Priority           int           `json:"priority" db:"priority"`
+}
+
+// WorkflowState holds the runtime state for a workflow execution
+type WorkflowState struct {
+	WorkflowID  string
+	stepCounter int
+}
+
+// NextStepID returns the next step ID and increments the counter
+func (ws *WorkflowState) NextStepID() int {
+	ws.stepCounter++
+	return ws.stepCounter
 }
 
 /********************************/
@@ -33,6 +53,7 @@ type WorkflowHandle[R any] interface {
 
 // workflowHandle is a concrete implementation of WorkflowHandle
 type workflowHandle[R any] struct {
+	workflowID string
 	resultChan chan R
 	errorChan  chan error
 	ctx        context.Context
@@ -54,9 +75,9 @@ func (h *workflowHandle[R]) GetResult() (R, error) {
 	}
 }
 
-/********************************/
-/******* WORKFLOW FUNCTION *******/
-/********************************/
+/**********************************/
+/******* WORKFLOW FUNCTIONS *******/
+/**********************************/
 type WorkflowFunc[P any, R any] func(ctx context.Context, input P) (R, error)
 
 type WorkflowParams struct {
@@ -65,39 +86,40 @@ type WorkflowParams struct {
 	Deadline   time.Time
 }
 
-func WithWorkflow[P any, R any](name string, fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
-	// TODO: name can be found using reflection. Must be FQDN.
-	registerWorkflow(name, fn)
-	return func(ctx context.Context, params WorkflowParams, input P) WorkflowHandle[R] {
+func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
+	// Also we should register the wrapped function
+	registerWorkflow(fn)
+	return func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
 		return runAsWorkflow(ctx, params, fn, input)
 	}
 }
 
-func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) WorkflowHandle[R] {
+func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) (WorkflowHandle[R], error) {
+	// First, create a context for the workflow
+	dbosWorkflowContext := context.Background()
+
+	// TODO Check if cancelled
+	// TODO Check if a result/error is already available
+
 	// Generate an ID for the workflow if not provided
 	if params.WorkflowID == "" {
 		params.WorkflowID = uuid.New().String()
 	}
 
-	// Compute the deadline
-	var deadline time.Time
-	if params.Timeout > 0 {
-		deadline = time.Now().Add(params.Timeout)
-	} else if !params.Deadline.IsZero() {
-		deadline = params.Deadline
-	}
-
 	workflowStatus := WorkflowStatus{
-		Status:    "PENDING",
-		ID:        params.WorkflowID,
-		CreatedAt: time.Now(),
-		Deadline:  deadline,
+		Status:        "PENDING",
+		ID:            params.WorkflowID,
+		CreatedAt:     time.Now(),
+		Deadline:      params.Deadline,
+		Timeout:       params.Timeout,
+		Input:         input,
+		ApplicationID: nil, // TODO: set application ID if available
 	}
 
 	// Init status // TODO: implement init status validation
-	_, err := getExecutor().systemDB.InsertWorkflowStatus(ctx, workflowStatus)
+	_, err := getExecutor().systemDB.InsertWorkflowStatus(dbosWorkflowContext, workflowStatus)
 	if err != nil {
-		panic("failed to insert workflow status: " + err.Error())
+		return nil, fmt.Errorf("inserting workflow status: %w", err)
 	}
 
 	// Channel to receive the result from the goroutine
@@ -107,53 +129,118 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	errorChan := make(chan error, 1)
 
 	// Create the handle
-	userFunctionContext := ctx
-	var userFunctionCancel context.CancelFunc
-	if params.Timeout > 0 {
-		userFunctionContext, userFunctionCancel = context.WithTimeout(ctx, params.Timeout)
-		defer userFunctionCancel() // Ensure the context is cancelled to free resources
-	} else if !params.Deadline.IsZero() {
-		userFunctionContext, userFunctionCancel = context.WithDeadline(ctx, params.Deadline)
-		defer userFunctionCancel() // Ensure the context is cancelled to free resources
-	}
 	handle := &workflowHandle[R]{
+		workflowID: workflowStatus.ID,
 		resultChan: resultChan,
 		errorChan:  errorChan,
-		ctx:        userFunctionContext,
+		ctx:        dbosWorkflowContext,
+	}
+
+	// Create workflow state to track step execution
+	workflowState := &WorkflowState{
+		WorkflowID:  workflowStatus.ID,
+		stepCounter: 0,
 	}
 
 	// Run the function in a goroutine
+	augmentUserContext := context.WithValue(ctx, "workflowState", workflowState)
 	go func() {
-		defer func() {
-			// Avoid crashing the application if the workflow function panics
-			if r := recover(); r != nil {
-				errorChan <- fmt.Errorf("workflow function panicked: %v", r)
-			}
-		}()
-		result, err := fn(ctx, input)
+		result, err := fn(augmentUserContext, input)
 		if err != nil {
+			fmt.Println("workflow function returned an error:", err)
+			recordErr := getExecutor().systemDB.RecordWorkflowError(dbosWorkflowContext, workflowErrorDBInput{workflowID: workflowStatus.ID, err: err})
+			if recordErr != nil {
+				// TODO: make sure to return both errors
+				fmt.Println("recording workflow error:", recordErr)
+				errorChan <- recordErr
+				return
+			}
 			errorChan <- err
 		} else {
+			recordErr := getExecutor().systemDB.RecordWorkflowOutput(dbosWorkflowContext, workflowOutputDBInput{workflowID: workflowStatus.ID, output: result})
+			if recordErr != nil {
+				fmt.Println("recording workflow output:", recordErr)
+				// We cannot return the user code result because we failed to record the output
+				errorChan <- recordErr
+				return
+			}
 			resultChan <- result
 		}
 	}()
 
 	// Run the peer goroutine to handle cancellation and timeout
-	go func() {
-		select {
-		case result := <-resultChan:
-			// Record the result
-			return
-		case err := <-errorChan:
-			// Record error
-			return
-		case <-userFunctionContext.Done():
-			// the context was cancelled or timed out
-			// Record timeout or cancellation
-			return
-
+	/*
+		if dbosWorkflowContext.Done() != nil {
+			fmt.Println("starting goroutine to handle workflow context cancellation or timeout")
+			go func() {
+				select {
+				case <-dbosWorkflowContext.Done():
+					// The context was cancelled or timed out: record timeout or cancellation
+					// CANCEL WORKFLOW HERE
+					return
+				}
+			}()
 		}
-	}()
+	*/
 
-	return handle
+	fmt.Println("Returning workflow handle for workflow ID:", params.WorkflowID)
+	return handle, nil
+}
+
+/******************************/
+/******* STEP FUNCTIONS *******/
+/******************************/
+
+type StepFunc[P any, R any] func(ctx context.Context, input P) (R, error)
+
+type StepParams struct {
+	MaxAttempts int
+	BackoffRate int
+}
+
+func WithStep[P any, R any](fn StepFunc[P, R]) func(ctx context.Context, params StepParams, input P) (R, error) {
+	// TODO : name can be found using reflection. Must be FQDN.
+	registerWorkflow(fn)
+	return func(ctx context.Context, params StepParams, input P) (R, error) {
+		return runAsStep(ctx, params, fn, input)
+	}
+}
+
+func runAsStep[P any, R any](ctx context.Context, params StepParams, fn StepFunc[P, R], input P) (R, error) {
+	// Get workflow state from context
+	workflowState, ok := ctx.Value("workflowState").(*WorkflowState)
+	if !ok || workflowState == nil {
+		return *new(R), fmt.Errorf("context does not contain valid workflow state, cannot run step")
+	}
+
+	// Check if cancelled
+	// Check if a result/error is already available
+
+	// Get next step ID
+	stepID := workflowState.NextStepID()
+
+	stepOutput, stepError := fn(ctx, input)
+	if stepError != nil {
+		fmt.Println("step function returned an error:", stepError)
+		err := getExecutor().systemDB.RecordOperationResult(ctx, recordOperationResultDBInput{
+			workflowID:  workflowState.WorkflowID,
+			operationID: stepID,
+			err:         stepError,
+		})
+		if err != nil {
+			fmt.Println("failed to record step error:", err)
+			return *new(R), fmt.Errorf("failed to record step error: %w", err)
+		}
+	} else {
+		err := getExecutor().systemDB.RecordOperationResult(ctx, recordOperationResultDBInput{
+			workflowID:  workflowState.WorkflowID,
+			operationID: stepID,
+			output:      stepOutput,
+		})
+		if err != nil {
+			fmt.Println("failed to record step output:", err)
+			return *new(R), fmt.Errorf("failed to record step output: %w", err)
+		}
+	}
+	return stepOutput, stepError
 }
