@@ -12,6 +12,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -349,6 +350,7 @@ type ListWorkflowsDBInput struct {
 	Limit              *int
 	Offset             *int
 	SortDesc           bool
+	Tx                 pgx.Tx
 }
 
 // ListWorkflows retrieves a list of workflows based on the provided filters
@@ -417,7 +419,15 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	}
 
 	// Execute the query
-	rows, err := s.pool.Query(ctx, query, qb.args...)
+	var rows pgx.Rows
+	var err error
+
+	if input.Tx != nil {
+		rows, err = input.Tx.Query(ctx, query, qb.args...)
+	} else {
+		rows, err = s.pool.Query(ctx, query, qb.args...)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute ListWorkflows query: %w", err)
 	}
@@ -487,6 +497,7 @@ type UpdateWorkflowStatusOptions struct {
 	Update         *UpdateWorkflowStatusUpdate
 	Where          *UpdateWorkflowStatusWhere
 	ThrowOnFailure *bool
+	Tx             pgx.Tx
 }
 
 type UpdateWorkflowStatusUpdate struct {
@@ -546,7 +557,16 @@ func (s *systemDatabase) UpdateWorkflowStatus(ctx context.Context, input UpdateW
 		strings.Join(qb.setClauses, ", "),
 		strings.Join(qb.whereClauses, " AND "))
 
-	commandTag, err := s.pool.Exec(ctx, query, qb.args...)
+	// Execute the query using transaction if provided, otherwise use connection pool
+	var commandTag pgconn.CommandTag
+	var err error
+
+	if input.Options.Tx != nil {
+		commandTag, err = input.Options.Tx.Exec(ctx, query, qb.args...)
+	} else {
+		commandTag, err = s.pool.Exec(ctx, query, qb.args...)
+	}
+
 	if err != nil {
 		return fmt.Errorf("failed to update workflow status: %w", err)
 	}
@@ -561,8 +581,18 @@ func (s *systemDatabase) UpdateWorkflowStatus(ctx context.Context, input UpdateW
 }
 
 func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) // Rollback if not committed
+
 	// Check if workflow exists
-	wfs, err := s.ListWorkflows(ctx, ListWorkflowsDBInput{WorkflowIDs: []string{workflowID}})
+	listInput := ListWorkflowsDBInput{
+		WorkflowIDs: []string{workflowID},
+		Tx:          tx,
+	}
+	wfs, err := s.ListWorkflows(ctx, listInput)
 	if err != nil {
 		return err
 	}
@@ -573,6 +603,10 @@ func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) 
 	wf := wfs[0]
 	switch wf.Status {
 	case "SUCCESS", "ERROR", "CANCELLED":
+		// Workflow is already in a terminal state, rollback and return
+		if err := tx.Rollback(ctx); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
 		return nil
 	}
 
@@ -581,13 +615,23 @@ func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) 
 		Status:     "CANCELLED",
 		Options: UpdateWorkflowStatusOptions{
 			Update: &UpdateWorkflowStatusUpdate{
-				QueueName:             nil, // Clear queue name on cancel
+				QueueName:             nil,
 				ResetDeduplicationID:  true,
 				ResetStartedAtEpochMs: true,
 			},
+			Tx: tx,
 		},
 	}
-	return s.UpdateWorkflowStatus(ctx, updateInput)
+
+	if err := s.UpdateWorkflowStatus(ctx, updateInput); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
 }
 
 /*******************************/
