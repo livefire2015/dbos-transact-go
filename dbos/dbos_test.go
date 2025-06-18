@@ -109,6 +109,11 @@ func setupDBOS(t *testing.T) {
 func TestWorkflowsWrapping(t *testing.T) {
 	setupDBOS(t)
 
+	// Eventually remove this, convenient for testing
+	for k, v := range registry {
+		fmt.Printf("Registered workflow: %s -> %T\n", k, v)
+	}
+
 	type testCase struct {
 		name           string
 		workflowFunc   func(context.Context, WorkflowParams, string) (any, error)
