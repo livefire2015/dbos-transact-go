@@ -153,17 +153,17 @@ func (s *systemDatabase) Destroy() {
 /*******************************/
 
 type InsertWorkflowResult struct {
-	Attempts                int     `json:"attempts"`
-	Status                  string  `json:"status"`
-	Name                    string  `json:"name"`
-	QueueName               *string `json:"queue_name"`
-	WorkflowDeadlineEpochMs *int64  `json:"workflow_deadline_epoch_ms"`
+	Attempts                int                `json:"attempts"`
+	Status                  WorkflowStatusType `json:"status"`
+	Name                    string             `json:"name"`
+	QueueName               *string            `json:"queue_name"`
+	WorkflowDeadlineEpochMs *int64             `json:"workflow_deadline_epoch_ms"`
 }
 
 func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error) {
 	// Set default values
 	attempts := 1
-	if initStatus.Status == "ENQUEUED" {
+	if initStatus.Status == WorkflowStatusEnqueued {
 		attempts = 0
 	}
 
