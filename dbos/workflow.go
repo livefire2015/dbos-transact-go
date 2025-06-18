@@ -53,6 +53,7 @@ type WorkflowHandle[R any] interface {
 
 // workflowHandle is a concrete implementation of WorkflowHandle
 type workflowHandle[R any] struct {
+	workflowID string
 	resultChan chan R
 	errorChan  chan error
 	ctx        context.Context
@@ -93,30 +94,12 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) func(ctx context.Context,
 	}
 }
 
-// TODO also return errors
 func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) (WorkflowHandle[R], error) {
 	// First, create a context for the workflow
 	dbosWorkflowContext := context.Background()
 
 	// TODO Check if cancelled
 	// TODO Check if a result/error is already available
-
-	// Compute the context deadline if any
-	var deadline time.Time
-	if params.Timeout > 0 {
-		deadline = time.Now().Add(params.Timeout)
-	} else if !params.Deadline.IsZero() {
-		deadline = params.Deadline
-	}
-
-	var workflowCancelFunction context.CancelFunc
-	if params.Timeout > 0 {
-		dbosWorkflowContext, workflowCancelFunction = context.WithTimeout(dbosWorkflowContext, params.Timeout)
-		defer workflowCancelFunction() // Ensure the context is cancelled to free resources
-	} else if !params.Deadline.IsZero() {
-		dbosWorkflowContext, workflowCancelFunction = context.WithDeadline(dbosWorkflowContext, params.Deadline)
-		defer workflowCancelFunction() // Ensure the context is cancelled to free resources
-	}
 
 	// Generate an ID for the workflow if not provided
 	if params.WorkflowID == "" {
@@ -127,7 +110,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		Status:        "PENDING",
 		ID:            params.WorkflowID,
 		CreatedAt:     time.Now(),
-		Deadline:      deadline,
+		Deadline:      params.Deadline,
 		Timeout:       params.Timeout,
 		Input:         input,
 		ApplicationID: nil, // TODO: set application ID if available
@@ -147,6 +130,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 
 	// Create the handle
 	handle := &workflowHandle[R]{
+		workflowID: workflowStatus.ID,
 		resultChan: resultChan,
 		errorChan:  errorChan,
 		ctx:        dbosWorkflowContext,
@@ -185,24 +169,19 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	}()
 
 	// Run the peer goroutine to handle cancellation and timeout
-	if dbosWorkflowContext.Done() != nil {
-		fmt.Println("starting goroutine to handle workflow context cancellation or timeout")
-		go func() {
-			select {
-			case <-dbosWorkflowContext.Done():
-				// The context was cancelled or timed out: record timeout or cancellation
-				timeoutErr := dbosWorkflowContext.Err()
-				err := getExecutor().systemDB.RecordWorkflowError(dbosWorkflowContext, workflowErrorDBInput{
-					workflowID: workflowStatus.ID,
-					err:        timeoutErr,
-				})
-				if err != nil {
-					fmt.Println("failed to record workflow error:", err)
+	/*
+		if dbosWorkflowContext.Done() != nil {
+			fmt.Println("starting goroutine to handle workflow context cancellation or timeout")
+			go func() {
+				select {
+				case <-dbosWorkflowContext.Done():
+					// The context was cancelled or timed out: record timeout or cancellation
+					// CANCEL WORKFLOW HERE
+					return
 				}
-				return
-			}
-		}()
-	}
+			}()
+		}
+	*/
 
 	fmt.Println("Returning workflow handle for workflow ID:", params.WorkflowID)
 	return handle, nil

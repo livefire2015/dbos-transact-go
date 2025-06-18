@@ -1,5 +1,24 @@
 package dbos
 
+/**
+This suite tests high level DBOS features:
+	- Calling workflows
+		* Simple functions
+		* Struct members
+		* (all variations of "what can be workflow function")
+		* With steps (and all their variations)
+		* With child workflows (and all their variations)
+	- Workflow handles
+		* get result
+		* get status
+		* get wf ID
+Specialized workflow features:
+	- idempotency
+	- timeout
+	- deadlines
+
+*/
+
 import (
 	"context"
 	"fmt"
