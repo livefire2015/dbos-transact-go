@@ -212,7 +212,7 @@ type StepParams struct {
 	BackoffRate int
 }
 
-func RunAsStep[R any](ctx context.Context, params StepParams, fn any, input ...any) (R, error) {
+func RunAsStep[P any, R any](ctx context.Context, params StepParams, fn StepFunc[P, R], input P) (R, error) {
 	// Get workflow state from context
 	workflowState, ok := ctx.Value("workflowState").(*WorkflowState)
 	if !ok || workflowState == nil {
@@ -225,37 +225,7 @@ func RunAsStep[R any](ctx context.Context, params StepParams, fn any, input ...a
 	// Get next step ID
 	stepID := workflowState.NextStepID()
 
-	// Use reflection to call the function with the proper arguments
-	results, err := callFunction(fn, append([]any{ctx}, input...)...)
-	if err != nil {
-		fmt.Println("step function call failed:", err)
-		recordErr := getExecutor().systemDB.RecordOperationResult(ctx, recordOperationResultDBInput{
-			workflowID:  workflowState.WorkflowID,
-			operationID: stepID,
-			err:         err,
-		})
-		if recordErr != nil {
-			fmt.Println("failed to record step error:", recordErr)
-			return *new(R), fmt.Errorf("failed to record step error: %w", recordErr)
-		}
-		return *new(R), err
-	}
-
-	// Extract the result and error from the function call
-	var stepOutput R
-	var stepError error
-
-	if len(results) >= 1 {
-		if result, ok := results[0].(R); ok {
-			stepOutput = result
-		}
-	}
-	if len(results) >= 2 {
-		if err, ok := results[1].(error); ok {
-			stepError = err
-		}
-	}
-
+	stepOutput, stepError := fn(ctx, input)
 	if stepError != nil {
 		fmt.Println("step function returned an error:", stepError)
 		err := getExecutor().systemDB.RecordOperationResult(ctx, recordOperationResultDBInput{
@@ -279,45 +249,4 @@ func RunAsStep[R any](ctx context.Context, params StepParams, fn any, input ...a
 		}
 	}
 	return stepOutput, stepError
-}
-
-// callFunction uses reflection to call a function with the given arguments
-func callFunction(fn any, args ...any) ([]any, error) {
-	fnValue := reflect.ValueOf(fn)
-	fnType := fnValue.Type()
-
-	if fnValue.Kind() != reflect.Func {
-		return nil, fmt.Errorf("provided value is not a function")
-	}
-
-	// Check if the number of arguments matches
-	if fnType.NumIn() != len(args) {
-		return nil, fmt.Errorf("function expects %d arguments, got %d", fnType.NumIn(), len(args))
-	}
-
-	// Convert arguments to reflect.Value and validate types
-	argValues := make([]reflect.Value, len(args))
-	for i, arg := range args {
-		argValue := reflect.ValueOf(arg)
-		expectedType := fnType.In(i)
-
-		// Check if the argument type is assignable to the expected parameter type
-		if !argValue.Type().AssignableTo(expectedType) {
-			return nil, fmt.Errorf("argument %d: expected type %s, got %s",
-				i, expectedType.String(), argValue.Type().String())
-		}
-
-		argValues[i] = argValue
-	}
-
-	// Call the function
-	resultValues := fnValue.Call(argValues)
-
-	// Convert results back to interface{}
-	results := make([]any, len(resultValues))
-	for i, result := range resultValues {
-		results[i] = result.Interface()
-	}
-
-	return results, nil
 }
