@@ -3,33 +3,49 @@ package dbos
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/google/uuid"
 )
 
+/*******************************/
+/******* WORKFLOW STATUS *******/
+/*******************************/
+
+type WorkflowStatusType string
+
+const (
+	WorkflowStatusPending         WorkflowStatusType = "PENDING"
+	WorkflowStatusEnqueued        WorkflowStatusType = "ENQUEUED"
+	WorkflowStatusSuccess         WorkflowStatusType = "SUCCESS"
+	WorkflowStatusError           WorkflowStatusType = "ERROR"
+	WorkflowStatusCancelled       WorkflowStatusType = "CANCELLED"
+	WorkflowStatusRetriesExceeded WorkflowStatusType = "RETRIES_EXCEEDED"
+)
+
 type WorkflowStatus struct {
-	ID                 string        `json:"workflow_uuid"`
-	Status             string        `json:"status"`
-	Name               string        `json:"name"`
-	AuthenticatedUser  *string       `json:"authenticated_user"`
-	AssumedRole        *string       `json:"assumed_role" db:"assumed_role"`
-	AuthenticatedRoles *string       `json:"authenticated_roles" db:"authenticated_roles"`
-	Output             any           `json:"output" db:"output"`
-	Error              error         `json:"error" db:"error"`
-	ExecutorID         *string       `json:"executor_id" db:"executor_id"`
-	CreatedAt          time.Time     `json:"created_at" db:"created_at"`
-	UpdatedAt          time.Time     `json:"updated_at" db:"updated_at"`
-	ApplicationVersion *string       `json:"application_version" db:"application_version"`
-	ApplicationID      *string       `json:"application_id" db:"application_id"`
-	Attempts           int           `json:"attempts" db:"attempts"`
-	QueueName          *string       `json:"queue_name" db:"queue_name"`
-	Timeout            time.Duration `json:"-" db:"-"` // Converted to/from workflow_timeout_ms
-	Deadline           time.Time     `json:"-" db:"-"` // Converted to/from workflow_deadline_epoch_ms
-	StartedAt          time.Time     `json:"-" db:"-"` // Converted to/from started_at_epoch_ms
-	DeduplicationID    *string       `json:"deduplication_id" db:"deduplication_id"`
-	Input              any           `json:"-" db:"-"` // Converted to/from inputs
-	Priority           int           `json:"priority" db:"priority"`
+	ID                 string             `json:"workflow_uuid"`
+	Status             WorkflowStatusType `json:"status"`
+	Name               string             `json:"name"`
+	AuthenticatedUser  *string            `json:"authenticated_user"`
+	AssumedRole        *string            `json:"assumed_role"`
+	AuthenticatedRoles *string            `json:"authenticated_roles"`
+	Output             any                `json:"output"`
+	Error              error              `json:"error"`
+	ExecutorID         *string            `json:"executor_id"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+	ApplicationVersion *string            `json:"application_version"`
+	ApplicationID      *string            `json:"application_id"`
+	Attempts           int                `json:"attempts"`
+	QueueName          *string            `json:"queue_name"`
+	Timeout            time.Duration      `json:"timeout"`
+	Deadline           time.Time          `json:"deadline"`
+	StartedAt          time.Time          `json:"started_at"`
+	DeduplicationID    *string            `json:"deduplication_id"`
+	Input              any                `json:"input"`
+	Priority           int                `json:"priority"`
 }
 
 // WorkflowState holds the runtime state for a workflow execution
@@ -107,13 +123,14 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	}
 
 	workflowStatus := WorkflowStatus{
-		Status:        "PENDING",
+		Status:        WorkflowStatusPending,
 		ID:            params.WorkflowID,
 		CreatedAt:     time.Now(),
 		Deadline:      params.Deadline,
 		Timeout:       params.Timeout,
 		Input:         input,
 		ApplicationID: nil, // TODO: set application ID if available
+		QueueName:     nil, // TODO: set queue name if available
 	}
 
 	// Init status // TODO: implement init status validation
@@ -148,18 +165,16 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		result, err := fn(augmentUserContext, input)
 		if err != nil {
 			fmt.Println("workflow function returned an error:", err)
-			recordErr := getExecutor().systemDB.RecordWorkflowError(dbosWorkflowContext, workflowErrorDBInput{workflowID: workflowStatus.ID, err: err})
+			recordErr := getExecutor().systemDB.UpdateWorkflowOutcome(dbosWorkflowContext, UpdateWorkflowOutcomeDBInput{workflowID: workflowStatus.ID, status: WorkflowStatusError, err: err})
 			if recordErr != nil {
 				// TODO: make sure to return both errors
-				fmt.Println("recording workflow error:", recordErr)
 				errorChan <- recordErr
 				return
 			}
 			errorChan <- err
 		} else {
-			recordErr := getExecutor().systemDB.RecordWorkflowOutput(dbosWorkflowContext, workflowOutputDBInput{workflowID: workflowStatus.ID, output: result})
+			recordErr := getExecutor().systemDB.UpdateWorkflowOutcome(dbosWorkflowContext, UpdateWorkflowOutcomeDBInput{workflowID: workflowStatus.ID, status: WorkflowStatusSuccess, output: result})
 			if recordErr != nil {
-				fmt.Println("recording workflow output:", recordErr)
 				// We cannot return the user code result because we failed to record the output
 				errorChan <- recordErr
 				return
@@ -183,7 +198,6 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		}
 	*/
 
-	fmt.Println("Returning workflow handle for workflow ID:", params.WorkflowID)
 	return handle, nil
 }
 
@@ -198,15 +212,7 @@ type StepParams struct {
 	BackoffRate int
 }
 
-func WithStep[P any, R any](fn StepFunc[P, R]) func(ctx context.Context, params StepParams, input P) (R, error) {
-	// TODO : name can be found using reflection. Must be FQDN.
-	registerWorkflow(fn)
-	return func(ctx context.Context, params StepParams, input P) (R, error) {
-		return runAsStep(ctx, params, fn, input)
-	}
-}
-
-func runAsStep[P any, R any](ctx context.Context, params StepParams, fn StepFunc[P, R], input P) (R, error) {
+func RunAsStep[P any, R any](ctx context.Context, params StepParams, fn StepFunc[P, R], input P) (R, error) {
 	// Get workflow state from context
 	workflowState, ok := ctx.Value("workflowState").(*WorkflowState)
 	if !ok || workflowState == nil {

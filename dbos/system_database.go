@@ -15,13 +15,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+/*******************************/
+/******* INTERFACE ********/
+/*******************************/
+
 type SystemDatabase interface {
-	Destroy() error
+	Destroy()
 	InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error)
-	RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error
-	RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error
 	RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error
 	ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) ([]WorkflowStatus, error)
+	UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowOutcomeDBInput) error
 }
 
 type systemDatabase struct {
@@ -138,10 +141,9 @@ func NewSystemDatabase() (SystemDatabase, error) {
 	}, nil
 }
 
-func (s *systemDatabase) Destroy() error {
+func (s *systemDatabase) Destroy() {
 	fmt.Println("Closing system database connection pool")
 	s.pool.Close()
-	return nil
 }
 
 /*******************************/
@@ -149,19 +151,17 @@ func (s *systemDatabase) Destroy() error {
 /*******************************/
 
 type InsertWorkflowResult struct {
-	Attempts                int    `json:"attempts"`
-	Status                  string `json:"status"`
-	Name                    string `json:"name"`
-	ClassName               string `json:"class_name"`
-	ConfigName              string `json:"config_name"`
-	QueueName               string `json:"queue_name"`
-	WorkflowDeadlineEpochMs *int64 `json:"workflow_deadline_epoch_ms"`
+	Attempts                int                `json:"attempts"`
+	Status                  WorkflowStatusType `json:"status"`
+	Name                    string             `json:"name"`
+	QueueName               *string            `json:"queue_name"`
+	WorkflowDeadlineEpochMs *int64             `json:"workflow_deadline_epoch_ms"`
 }
 
 func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error) {
 	// Set default values
 	attempts := 1
-	if initStatus.Status == "ENQUEUED" {
+	if initStatus.Status == WorkflowStatusEnqueued {
 		attempts = 0
 	}
 
@@ -250,45 +250,6 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
 	return &result, nil
 }
 
-// FIXME: merge in a single function that knows whether to set error or output
-type workflowOutputDBInput struct {
-	workflowID string
-	output     any // XXX This will be updated to reflect that other types than string can be recorded
-}
-
-func (s *systemDatabase) RecordWorkflowOutput(ctx context.Context, input workflowOutputDBInput) error {
-	query := `UPDATE dbos.workflow_status
-		SET output = $1, updated_at = $2, status = 'SUCCESS'
-		WHERE workflow_uuid = $3`
-
-	fmt.Println("Recording workflow output:", input)
-	_, err := s.pool.Exec(ctx, query, input.output.(string), time.Now().UnixMilli(), input.workflowID)
-	if err != nil {
-		return fmt.Errorf("failed to record workflow output: %w", err)
-	}
-
-	return nil
-}
-
-type workflowErrorDBInput struct {
-	workflowID string
-	err        error
-}
-
-func (s *systemDatabase) RecordWorkflowError(ctx context.Context, input workflowErrorDBInput) error {
-	query := `UPDATE dbos.workflow_status
-		SET error = $1, updated_at = $2, status = 'FAILED'
-		WHERE workflow_uuid = $3`
-
-	fmt.Println("Recording workflow error:", input.err)
-	_, execErr := s.pool.Exec(ctx, query, input.err.Error(), time.Now().UnixMilli(), input.workflowID)
-	if execErr != nil {
-		return fmt.Errorf("failed to record workflow error: %w", execErr)
-	}
-
-	return nil
-}
-
 type recordOperationResultDBInput struct {
 	workflowID    string
 	operationID   int
@@ -350,67 +311,52 @@ type ListWorkflowsDBInput struct {
 	Limit              *int
 	Offset             *int
 	SortDesc           bool
+	Tx                 pgx.Tx
 }
 
 // ListWorkflows retrieves a list of workflows based on the provided filters
 func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) ([]WorkflowStatus, error) {
+	qb := newQueryBuilder()
+
 	// Build the base query
-	query := `SELECT workflow_uuid, status, name, authenticated_user, assumed_role, authenticated_roles,
+	baseQuery := `SELECT workflow_uuid, status, name, authenticated_user, assumed_role, authenticated_roles,
 	                 output, error, executor_id, created_at, updated_at, application_version, application_id,
 	                 attempts, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
 					 deduplication_id, inputs, priority
-	          FROM dbos.workflow_status WHERE 1=1`
+	          FROM dbos.workflow_status`
 
-	var args []any
-	argCounter := 0
-
-	// Add filters
+	// Add filters using query builder
 	if input.WorkflowName != nil {
-		argCounter++
-		query += fmt.Sprintf(" AND name = $%d", argCounter)
-		args = append(args, *input.WorkflowName)
+		qb.addWhere("name", *input.WorkflowName)
 	}
-
 	if input.WorkflowIDPrefix != nil {
-		argCounter++
-		query += fmt.Sprintf(" AND workflow_uuid LIKE $%d", argCounter)
-		args = append(args, *input.WorkflowIDPrefix+"%")
+		qb.addWhereLike("workflow_uuid", *input.WorkflowIDPrefix+"%")
 	}
-
 	if input.WorkflowIDs != nil && len(input.WorkflowIDs) > 0 {
-		argCounter++
-		query += fmt.Sprintf(" AND workflow_uuid = ANY($%d)", argCounter)
-		args = append(args, input.WorkflowIDs)
+		qb.addWhereAny("workflow_uuid", input.WorkflowIDs)
 	}
-
 	if input.AuthenticatedUser != nil {
-		argCounter++
-		query += fmt.Sprintf(" AND authenticated_user = $%d", argCounter)
-		args = append(args, *input.AuthenticatedUser)
+		qb.addWhere("authenticated_user", *input.AuthenticatedUser)
 	}
-
 	if !input.StartTime.IsZero() {
-		argCounter++
-		query += fmt.Sprintf(" AND created_at >= $%d", argCounter)
-		args = append(args, input.StartTime.UnixMilli())
+		qb.addWhereGreaterEqual("created_at", input.StartTime.UnixMilli())
 	}
-
 	if !input.EndTime.IsZero() {
-		argCounter++
-		query += fmt.Sprintf(" AND created_at <= $%d", argCounter)
-		args = append(args, input.EndTime.UnixMilli())
+		qb.addWhereLessEqual("created_at", input.EndTime.UnixMilli())
 	}
-
 	if input.Status != nil {
-		argCounter++
-		query += fmt.Sprintf(" AND status = $%d", argCounter)
-		args = append(args, *input.Status)
+		qb.addWhere("status", *input.Status)
+	}
+	if input.ApplicationVersion != nil {
+		qb.addWhere("application_version", *input.ApplicationVersion)
 	}
 
-	if input.ApplicationVersion != nil {
-		argCounter++
-		query += fmt.Sprintf(" AND application_version = $%d", argCounter)
-		args = append(args, *input.ApplicationVersion)
+	// Build complete query
+	var query string
+	if len(qb.whereClauses) > 0 {
+		query = fmt.Sprintf("%s WHERE %s", baseQuery, strings.Join(qb.whereClauses, " AND "))
+	} else {
+		query = baseQuery
 	}
 
 	// Add sorting
@@ -422,19 +368,27 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 
 	// Add limit and offset
 	if input.Limit != nil {
-		argCounter++
-		query += fmt.Sprintf(" LIMIT $%d", argCounter)
-		args = append(args, *input.Limit)
+		qb.argCounter++
+		query += fmt.Sprintf(" LIMIT $%d", qb.argCounter)
+		qb.args = append(qb.args, *input.Limit)
 	}
 
 	if input.Offset != nil {
-		argCounter++
-		query += fmt.Sprintf(" OFFSET $%d", argCounter)
-		args = append(args, *input.Offset)
+		qb.argCounter++
+		query += fmt.Sprintf(" OFFSET $%d", qb.argCounter)
+		qb.args = append(qb.args, *input.Offset)
 	}
 
 	// Execute the query
-	rows, err := s.pool.Query(ctx, query, args...)
+	var rows pgx.Rows
+	var err error
+
+	if input.Tx != nil {
+		rows, err = input.Tx.Query(ctx, query, qb.args...)
+	} else {
+		rows, err = s.pool.Query(ctx, query, qb.args...)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute ListWorkflows query: %w", err)
 	}
@@ -492,4 +446,147 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	}
 
 	return workflows, nil
+}
+
+type UpdateWorkflowOutcomeDBInput struct {
+	workflowID string
+	status     WorkflowStatusType
+	output     any
+	err        error
+	tx         pgx.Tx
+}
+
+// Will evolve as we serialize all output and error types
+func (s *systemDatabase) UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowOutcomeDBInput) error {
+	query := `UPDATE dbos.workflow_status
+			  SET status = $1, output = $2, error = $3, updated_at = $4, deduplication_id = NULL
+			  WHERE workflow_uuid = $5`
+
+	outputStr := "NULL"
+	if input.output != nil {
+		outputStr = fmt.Sprintf("%v", input.output)
+	}
+	errorStr := "NULL"
+	if input.err != nil {
+		errorStr = input.err.Error()
+	}
+
+	var err error
+	if input.tx != nil {
+		_, err = input.tx.Exec(ctx, query, input.status, outputStr, errorStr, time.Now().UnixMilli(), input.workflowID)
+	} else {
+		_, err = s.pool.Exec(ctx, query, input.status, outputStr, errorStr, time.Now().UnixMilli(), input.workflowID)
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to update workflow status: %w", err)
+	}
+	return nil
+}
+
+func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx) // Rollback if not committed
+
+	// Check if workflow exists
+	listInput := ListWorkflowsDBInput{
+		WorkflowIDs: []string{workflowID},
+		Tx:          tx,
+	}
+	wfs, err := s.ListWorkflows(ctx, listInput)
+	if err != nil {
+		return err
+	}
+	if len(wfs) == 0 {
+		return fmt.Errorf("Workflow %s not found", workflowID)
+	}
+
+	wf := wfs[0]
+	switch wf.Status {
+	case "SUCCESS", "ERROR", "CANCELLED":
+		// Workflow is already in a terminal state, rollback and return
+		if err := tx.Rollback(ctx); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return nil
+	}
+
+	//Set the workflow's status to CANCELLED
+	updateStatusQuery := `UPDATE dbos.workflow_status
+						  SET status = 'CANCELLED', updated_at = $1
+						  WHERE workflow_uuid = $2`
+
+	_, err = tx.Exec(ctx, updateStatusQuery, time.Now().UnixMilli(), workflowID)
+	if err != nil {
+		return fmt.Errorf("failed to update workflow status to CANCELLED: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+/*******************************/
+/******* UTILS ********/
+/*******************************/
+
+type queryBuilder struct {
+	setClauses   []string
+	whereClauses []string
+	args         []any
+	argCounter   int
+}
+
+func newQueryBuilder() *queryBuilder {
+	return &queryBuilder{
+		setClauses:   make([]string, 0),
+		whereClauses: make([]string, 0),
+		args:         make([]any, 0),
+		argCounter:   0,
+	}
+}
+
+func (qb *queryBuilder) addSet(column string, value any) {
+	qb.argCounter++
+	qb.setClauses = append(qb.setClauses, fmt.Sprintf("%s=$%d", column, qb.argCounter))
+	qb.args = append(qb.args, value)
+}
+
+func (qb *queryBuilder) addSetRaw(clause string) {
+	qb.setClauses = append(qb.setClauses, clause)
+}
+
+func (qb *queryBuilder) addWhere(column string, value any) {
+	qb.argCounter++
+	qb.whereClauses = append(qb.whereClauses, fmt.Sprintf("%s=$%d", column, qb.argCounter))
+	qb.args = append(qb.args, value)
+}
+
+func (qb *queryBuilder) addWhereLike(column string, value any) {
+	qb.argCounter++
+	qb.whereClauses = append(qb.whereClauses, fmt.Sprintf("%s LIKE $%d", column, qb.argCounter))
+	qb.args = append(qb.args, value)
+}
+
+func (qb *queryBuilder) addWhereAny(column string, values any) {
+	qb.argCounter++
+	qb.whereClauses = append(qb.whereClauses, fmt.Sprintf("%s = ANY($%d)", column, qb.argCounter))
+	qb.args = append(qb.args, values)
+}
+
+func (qb *queryBuilder) addWhereGreaterEqual(column string, value any) {
+	qb.argCounter++
+	qb.whereClauses = append(qb.whereClauses, fmt.Sprintf("%s >= $%d", column, qb.argCounter))
+	qb.args = append(qb.args, value)
+}
+
+func (qb *queryBuilder) addWhereLessEqual(column string, value any) {
+	qb.argCounter++
+	qb.whereClauses = append(qb.whereClauses, fmt.Sprintf("%s <= $%d", column, qb.argCounter))
+	qb.args = append(qb.args, value)
 }

@@ -5,7 +5,7 @@ import (
 )
 
 type Executor interface {
-	Destroy() error
+	Destroy()
 }
 
 // DBOS represents the main DBOS instance
@@ -43,13 +43,12 @@ func Launch() error {
 
 // Close closes the DBOS instance and its resources
 // TODO: rename destroy
-func Destroy() error {
+func Destroy() {
 	if dbos == nil {
-		// FIXME: just emit a warning
-		return fmt.Errorf("DBOS instance is nil, cannot destroy")
+		fmt.Println("warning: DBOS instance is nil, cannot destroy")
 	}
 	if dbos.systemDB != nil {
-		return dbos.systemDB.Destroy()
+		dbos.systemDB.Destroy()
 	}
-	return nil
+	dbos = nil // Mark the DBOS instance for garbage collection
 }
