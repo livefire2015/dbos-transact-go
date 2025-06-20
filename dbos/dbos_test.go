@@ -18,10 +18,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// Global counter for idempotency testing
+var idempotencyCounter int64
+
 var (
-	simpleWf         = WithWorkflow(simpleWorkflow)
-	simpleWfError    = WithWorkflow(simpleWorkflowError)
-	simpleWfWithStep = WithWorkflow(simpleWorkflowWithStep)
+	simpleWf                  = WithWorkflow(simpleWorkflow)
+	simpleWfError             = WithWorkflow(simpleWorkflowError)
+	simpleWfWithStep          = WithWorkflow(simpleWorkflowWithStep)
+	simpleWfWithStepError     = WithWorkflow(simpleWorkflowWithStepError)
+	simpleWfWithChildWorkflow = WithWorkflow(simpleWorkflowWithChildWorkflow)
 	// struct methods
 	s              = workflowStruct{}
 	simpleWfStruct = WithWorkflow(s.simpleWorkflow)
@@ -38,6 +43,8 @@ var (
 	wfClose = WithWorkflow(func(ctx context.Context, in string) (string, error) {
 		return prefix + in, nil
 	})
+	// Workflow for idempotency testing
+	idempotencyWf = WithWorkflow(idempotencyWorkflow)
 )
 
 func simpleWorkflow(ctxt context.Context, input string) (string, error) {
@@ -54,6 +61,28 @@ func simpleWorkflowWithStep(ctx context.Context, input string) (string, error) {
 
 func simpleStep(ctx context.Context, input string) (string, error) {
 	return "from step", nil
+}
+
+func simpleStepError(ctx context.Context, input string) (string, error) {
+	return "", fmt.Errorf("step failure")
+}
+
+func simpleWorkflowWithStepError(ctx context.Context, input string) (string, error) {
+	return RunAsStep[string](ctx, StepParams{}, simpleStepError, input)
+}
+
+func simpleWorkflowWithChildWorkflow(ctx context.Context, input string) (string, error) {
+	childHandle, err := simpleWfWithStep(ctx, WorkflowParams{}, input)
+	if err != nil {
+		return "", err
+	}
+	return childHandle.GetResult()
+}
+
+// idempotencyWorkflow increments a global counter and returns the input
+func idempotencyWorkflow(ctx context.Context, input string) (string, error) {
+	idempotencyCounter += 1
+	return input, nil
 }
 
 // Unified struct that demonstrates both pointer and value receiver methods
@@ -249,6 +278,32 @@ func TestWorkflowsWrapping(t *testing.T) {
 			expectedResult: "anonymous-test",
 			expectError:    false,
 		},
+		{
+			name: "SimpleWorkflowWithChildWorkflow",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := simpleWfWithChildWorkflow(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:          "echo",
+			expectedResult: "from step",
+			expectError:    false,
+		},
+		{
+			name: "SimpleWorkflowWithStepError",
+			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+				handle, err := simpleWfWithStepError(ctx, params, input)
+				if err != nil {
+					return nil, err
+				}
+				return handle.GetResult()
+			},
+			input:         "echo",
+			expectError:   true,
+			expectedError: "step failure",
+		},
 	}
 
 	for _, tc := range tests {
@@ -272,6 +327,91 @@ func TestWorkflowsWrapping(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestChildWorkflow(t *testing.T) {
+	setupDBOS(t)
+
+	t.Run("ChildWorkflowIDPattern", func(t *testing.T) {
+		parentWorkflowID := uuid.NewString()
+
+		// Create a parent workflow that calls a child workflow
+		parentWf := WithWorkflow(func(ctx context.Context, input string) (string, error) {
+			childHandle, err := simpleWfWithChildWorkflow(ctx, WorkflowParams{}, input)
+			if err != nil {
+				return "", err
+			}
+
+			// Verify child workflow ID follows the pattern: parentID-functionID
+			childWorkflowID := childHandle.GetWorkflowID()
+			expectedPrefix := parentWorkflowID + "-0"
+			if childWorkflowID != expectedPrefix {
+				return "", fmt.Errorf("expected child workflow ID to be %s, got %s", expectedPrefix, childWorkflowID)
+			}
+
+			return childHandle.GetResult()
+		})
+
+		// Execute the parent workflow
+		parentHandle, err := parentWf(context.Background(), WorkflowParams{WorkflowID: parentWorkflowID}, "test-input")
+		if err != nil {
+			t.Fatalf("failed to execute parent workflow: %v", err)
+		}
+
+		// Verify the result
+		result, err := parentHandle.GetResult()
+		if err != nil {
+			t.Fatalf("expected no error but got: %v", err)
+		}
+
+		// The result should be from the child workflow's step
+		expectedResult := "from step"
+		if result != expectedResult {
+			t.Fatalf("expected result %v but got %v", expectedResult, result)
+		}
+	})
+}
+
+func TestWorkflowIdempotency(t *testing.T) {
+	setupDBOS(t)
+
+	t.Run("WorkflowExecutedOnlyOnce", func(t *testing.T) {
+		idempotencyCounter = 0
+
+		workflowID := uuid.NewString()
+		input := "idempotency-test"
+
+		// Execute the same workflow twice with the same ID
+		// First execution
+		handle1, err := idempotencyWf(context.Background(), WorkflowParams{WorkflowID: workflowID}, input)
+		if err != nil {
+			t.Fatalf("failed to execute workflow first time: %v", err)
+		}
+		result1, err := handle1.GetResult()
+		if err != nil {
+			t.Fatalf("failed to get result from first execution: %v", err)
+		}
+
+		// Second execution with the same workflow ID
+		handle2, err := idempotencyWf(context.Background(), WorkflowParams{WorkflowID: workflowID}, input)
+		if err != nil {
+			t.Fatalf("failed to execute workflow second time: %v", err)
+		}
+		result2, err := handle2.GetResult()
+		if err != nil {
+			t.Fatalf("failed to get result from second execution: %v", err)
+		}
+
+		// Verify both executions return the same result
+		if result1 != result2 {
+			t.Fatalf("expected same result from both executions, got %v and %v", result1, result2)
+		}
+
+		// Verify the counter was only incremented once (idempotency)
+		if idempotencyCounter != 1 {
+			t.Fatalf("expected counter to be 1 (workflow executed only once), but got %d", idempotencyCounter)
+		}
+	})
 }
 
 /*

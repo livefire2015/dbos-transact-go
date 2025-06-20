@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"runtime"
 	"time"
 
 	"github.com/google/uuid"
@@ -61,10 +62,11 @@ func (ws *WorkflowState) NextStepID() int {
 }
 
 /********************************/
-/******* WORKFLOW HANDLE ********/
+/******* WORKFLOW HANDLES ********/
 /********************************/
 type WorkflowHandle[R any] interface {
 	GetResult() (R, error)
+	GetWorkflowID() string // XXX we could have a base struct with GetWorkflowID and then embed it in the implementations
 }
 
 // workflowHandle is a concrete implementation of WorkflowHandle
@@ -72,11 +74,9 @@ type workflowHandle[R any] struct {
 	workflowID string
 	resultChan chan R
 	errorChan  chan error
-	ctx        context.Context
 }
 
 // GetResult waits for the workflow to complete and returns the result
-// TODO: for now this uses channels, but will be replaced with system DB lookups
 func (h *workflowHandle[R]) GetResult() (R, error) {
 	select {
 	case result := <-h.resultChan:
@@ -84,11 +84,29 @@ func (h *workflowHandle[R]) GetResult() (R, error) {
 	case err := <-h.errorChan:
 		var zero R
 		return zero, err
-	case <-h.ctx.Done():
-		// This handles timeouts
-		var zero R
-		return zero, h.ctx.Err()
 	}
+}
+
+func (h *workflowHandle[R]) GetWorkflowID() string {
+	return h.workflowID
+}
+
+type workflowPollingHandle[R any] struct {
+	workflowID string
+}
+
+func (h *workflowPollingHandle[R]) GetResult() (R, error) {
+	ctx := context.Background()
+	result, err := getExecutor().systemDB.AwaitWorkflowResult(ctx, h.workflowID)
+	typedResult, ok := result.(R)
+	if !ok {
+		return *new(R), fmt.Errorf("failed to cast workflow result to expected type %T", typedResult)
+	}
+	return typedResult, err
+}
+
+func (h *workflowPollingHandle[R]) GetWorkflowID() string {
+	return h.workflowID
 }
 
 /**********************************/
@@ -114,17 +132,28 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	// First, create a context for the workflow
 	dbosWorkflowContext := context.Background()
 
+	// Check if we are within a workflow (and thus a child workflow)
+	parentWorkflowState, ok := ctx.Value("workflowState").(*WorkflowState)
+	isChildWorkflow := ok && parentWorkflowState != nil
+
 	// TODO Check if cancelled
-	// TODO Check if a result/error is already available
 
 	// Generate an ID for the workflow if not provided
+	var workflowID string
 	if params.WorkflowID == "" {
-		params.WorkflowID = uuid.New().String()
+		if isChildWorkflow {
+			stepID := parentWorkflowState.NextStepID()
+			workflowID = fmt.Sprintf("%s-%d", parentWorkflowState.WorkflowID, stepID)
+		} else {
+			workflowID = uuid.New().String()
+		}
+	} else {
+		workflowID = params.WorkflowID
 	}
 
 	workflowStatus := WorkflowStatus{
 		Status:        WorkflowStatusPending,
-		ID:            params.WorkflowID,
+		ID:            workflowID,
 		CreatedAt:     time.Now(),
 		Deadline:      params.Deadline,
 		Timeout:       params.Timeout,
@@ -133,10 +162,51 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		QueueName:     nil, // TODO: set queue name if available
 	}
 
-	// Init status // TODO: implement init status validation
-	_, err := getExecutor().systemDB.InsertWorkflowStatus(dbosWorkflowContext, workflowStatus)
+	// TODO: before init status, check if we are recovering a child workflow, and return a (DB) handle for it.
+
+	// Init status and record child workflow relationship in a single transaction
+	tx, err := getExecutor().systemDB.(*systemDatabase).pool.Begin(dbosWorkflowContext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(dbosWorkflowContext) // Rollback if not committed
+
+	// Insert workflow status with transaction
+	insertInput := InsertWorkflowStatusDBInput{
+		Status: workflowStatus,
+		Tx:     tx,
+	}
+	insertStatusResult, err := getExecutor().systemDB.InsertWorkflowStatus(dbosWorkflowContext, insertInput)
 	if err != nil {
 		return nil, fmt.Errorf("inserting workflow status: %w", err)
+	}
+
+	switch insertStatusResult.Status {
+	case WorkflowStatusSuccess, WorkflowStatusError:
+		// Workflow already ran, return a DB handle to get the result
+		return &workflowPollingHandle[R]{workflowID: workflowStatus.ID}, nil
+	}
+
+	// Record child workflow relationship if this is a child workflow
+	if isChildWorkflow {
+		// Get the step ID that was used for generating the child workflow ID
+		stepID := parentWorkflowState.stepCounter
+		childInput := RecordChildWorkflowDBInput{
+			ParentWorkflowID: parentWorkflowState.WorkflowID,
+			ChildWorkflowID:  workflowStatus.ID,
+			FunctionName:     runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(), // Will need to test this
+			FunctionID:       stepID,
+			Tx:               tx,
+		}
+		err = getExecutor().systemDB.RecordChildWorkflow(dbosWorkflowContext, childInput)
+		if err != nil {
+			return nil, fmt.Errorf("recording child workflow: %w", err)
+		}
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(dbosWorkflowContext); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	// Channel to receive the result from the goroutine
@@ -150,13 +220,12 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		workflowID: workflowStatus.ID,
 		resultChan: resultChan,
 		errorChan:  errorChan,
-		ctx:        dbosWorkflowContext,
 	}
 
 	// Create workflow state to track step execution
 	workflowState := &WorkflowState{
 		WorkflowID:  workflowStatus.ID,
-		stepCounter: 0,
+		stepCounter: -1,
 	}
 
 	// Run the function in a goroutine

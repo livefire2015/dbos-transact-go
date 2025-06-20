@@ -3,6 +3,7 @@ package dbos
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -21,10 +23,12 @@ import (
 
 type SystemDatabase interface {
 	Destroy()
-	InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error)
+	InsertWorkflowStatus(ctx context.Context, input InsertWorkflowStatusDBInput) (*InsertWorkflowResult, error)
 	RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error
+	RecordChildWorkflow(ctx context.Context, input RecordChildWorkflowDBInput) error
 	ListWorkflows(ctx context.Context, input ListWorkflowsDBInput) ([]WorkflowStatus, error)
 	UpdateWorkflowOutcome(ctx context.Context, input UpdateWorkflowOutcomeDBInput) error
+	AwaitWorkflowResult(ctx context.Context, workflowID string) (any, error)
 }
 
 type systemDatabase struct {
@@ -158,7 +162,14 @@ type InsertWorkflowResult struct {
 	WorkflowDeadlineEpochMs *int64             `json:"workflow_deadline_epoch_ms"`
 }
 
-func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus WorkflowStatus) (*InsertWorkflowResult, error) {
+type InsertWorkflowStatusDBInput struct {
+	Status WorkflowStatus
+	Tx     pgx.Tx
+}
+
+func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertWorkflowStatusDBInput) (*InsertWorkflowResult, error) {
+	initStatus := input.Status
+
 	// Set default values
 	attempts := 1
 	if initStatus.Status == WorkflowStatusEnqueued {
@@ -188,6 +199,7 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
 		inputStr = fmt.Sprintf("%v", initStatus.Input)
 	}
 
+	// TODO do not update executor_id when enqueuing a workflow
 	query := `INSERT INTO dbos.workflow_status (
         workflow_uuid,
         status,
@@ -216,32 +228,63 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, initStatus Wo
         RETURNING attempts, status, name, queue_name, workflow_deadline_epoch_ms`
 
 	var result InsertWorkflowResult
-	err := s.pool.QueryRow(ctx, query,
-		initStatus.ID,
-		initStatus.Status,
-		initStatus.Name,
-		initStatus.QueueName,
-		initStatus.AuthenticatedUser,
-		initStatus.AssumedRole,
-		initStatus.AuthenticatedRoles,
-		initStatus.ExecutorID,
-		initStatus.ApplicationVersion,
-		initStatus.ApplicationID,
-		initStatus.CreatedAt.UnixMilli(),
-		attempts,
-		updatedAt.UnixMilli(),
-		timeoutMs,
-		deadline,
-		inputStr,
-		initStatus.DeduplicationID,
-		initStatus.Priority,
-	).Scan(
-		&result.Attempts,
-		&result.Status,
-		&result.Name,
-		&result.QueueName,
-		&result.WorkflowDeadlineEpochMs,
-	)
+	var err error
+
+	if input.Tx != nil {
+		err = input.Tx.QueryRow(ctx, query,
+			initStatus.ID,
+			initStatus.Status,
+			initStatus.Name,
+			initStatus.QueueName,
+			initStatus.AuthenticatedUser,
+			initStatus.AssumedRole,
+			initStatus.AuthenticatedRoles,
+			initStatus.ExecutorID,
+			initStatus.ApplicationVersion,
+			initStatus.ApplicationID,
+			initStatus.CreatedAt.UnixMilli(),
+			attempts,
+			updatedAt.UnixMilli(),
+			timeoutMs,
+			deadline,
+			inputStr,
+			initStatus.DeduplicationID,
+			initStatus.Priority,
+		).Scan(
+			&result.Attempts,
+			&result.Status,
+			&result.Name,
+			&result.QueueName,
+			&result.WorkflowDeadlineEpochMs,
+		)
+	} else {
+		err = s.pool.QueryRow(ctx, query,
+			initStatus.ID,
+			initStatus.Status,
+			initStatus.Name,
+			initStatus.QueueName,
+			initStatus.AuthenticatedUser,
+			initStatus.AssumedRole,
+			initStatus.AuthenticatedRoles,
+			initStatus.ExecutorID,
+			initStatus.ApplicationVersion,
+			initStatus.ApplicationID,
+			initStatus.CreatedAt.UnixMilli(),
+			attempts,
+			updatedAt.UnixMilli(),
+			timeoutMs,
+			deadline,
+			inputStr,
+			initStatus.DeduplicationID,
+			initStatus.Priority,
+		).Scan(
+			&result.Attempts,
+			&result.Status,
+			&result.Name,
+			&result.QueueName,
+			&result.WorkflowDeadlineEpochMs,
+		)
+	}
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert workflow status: %w", err)
@@ -256,6 +299,14 @@ type recordOperationResultDBInput struct {
 	operationName string
 	output        any
 	err           error
+}
+
+type RecordChildWorkflowDBInput struct {
+	ParentWorkflowID string
+	ChildWorkflowID  string
+	FunctionID       int
+	FunctionName     string
+	Tx               pgx.Tx
 }
 
 func (s *systemDatabase) RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error {
@@ -293,6 +344,45 @@ func (s *systemDatabase) RecordOperationResult(ctx context.Context, input record
 
 	if commandTag.RowsAffected() == 0 {
 		fmt.Printf("RecordOperationResult - WARNING: No rows were affected by the insert\n")
+	}
+
+	return nil
+}
+
+func (s *systemDatabase) RecordChildWorkflow(ctx context.Context, input RecordChildWorkflowDBInput) error {
+	query := `INSERT INTO dbos.operation_outputs
+            (workflow_uuid, function_id, function_name, child_workflow_id)
+            VALUES ($1, $2, $3, $4)`
+
+	var commandTag pgconn.CommandTag
+	var err error
+
+	if input.Tx != nil {
+		commandTag, err = input.Tx.Exec(ctx, query,
+			input.ParentWorkflowID,
+			input.FunctionID,
+			input.FunctionName,
+			input.ChildWorkflowID,
+		)
+	} else {
+		commandTag, err = s.pool.Exec(ctx, query,
+			input.ParentWorkflowID,
+			input.FunctionID,
+			input.FunctionName,
+			input.ChildWorkflowID,
+		)
+	}
+
+	if err != nil {
+		// Check for unique constraint violation (conflict ID error)
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+			return fmt.Errorf("workflow conflict ID error for parent workflow %s", input.ParentWorkflowID)
+		}
+		return fmt.Errorf("failed to record child workflow: %w", err)
+	}
+
+	if commandTag.RowsAffected() == 0 {
+		fmt.Printf("RecordChildWorkflow - WARNING: No rows were affected by the insert\n")
 	}
 
 	return nil
@@ -529,6 +619,34 @@ func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) 
 	}
 
 	return nil
+}
+
+func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID string) (any, error) {
+	query := `SELECT status, output, error FROM dbos.workflow_status WHERE workflow_uuid = $1`
+	var status WorkflowStatusType
+	for {
+		row := s.pool.QueryRow(ctx, query, workflowID)
+		var outputStr, errorStr *string
+		err := row.Scan(&status, &outputStr, &errorStr)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			return nil, fmt.Errorf("failed to query workflow status: %w", err)
+		}
+
+		switch status {
+		case WorkflowStatusSuccess:
+			return *outputStr, nil // Assuming outputStr can be directly returned as R
+		case WorkflowStatusError:
+			return nil, errors.New(*errorStr) // Assuming errorStr can be converted to an error type
+		case WorkflowStatusCancelled:
+			return nil, fmt.Errorf("workflow %s was cancelled", workflowID)
+		default:
+			time.Sleep(1 * time.Second) // Wait before checking again
+		}
+	}
 }
 
 /*******************************/
