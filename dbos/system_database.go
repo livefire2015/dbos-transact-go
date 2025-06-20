@@ -352,8 +352,7 @@ func (s *systemDatabase) RecordOperationResult(ctx context.Context, input record
 func (s *systemDatabase) RecordChildWorkflow(ctx context.Context, input RecordChildWorkflowDBInput) error {
 	query := `INSERT INTO dbos.operation_outputs
             (workflow_uuid, function_id, function_name, child_workflow_id)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT DO NOTHING`
+            VALUES ($1, $2, $3, $4)`
 
 	var commandTag pgconn.CommandTag
 	var err error
