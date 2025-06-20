@@ -21,6 +21,22 @@ import (
 // Global counter for idempotency testing
 var idempotencyCounter int64
 
+// Test struct types for encoding/decoding
+type SimpleStruct struct {
+	Name  string `json:"name"`
+	Value int    `json:"value"`
+}
+
+type StepInputStruct struct {
+	Data SimpleStruct `json:"data"`
+	ID   string       `json:"id"`
+}
+
+type StepOutputStruct struct {
+	Input    StepInputStruct `json:"input"`
+	StepInfo string          `json:"step_info"`
+}
+
 var (
 	simpleWf                  = WithWorkflow(simpleWorkflow)
 	simpleWfError             = WithWorkflow(simpleWorkflowError)
@@ -45,6 +61,8 @@ var (
 	})
 	// Workflow for idempotency testing
 	idempotencyWf = WithWorkflow(idempotencyWorkflow)
+	// Workflow for struct encoding testing
+	structWfWithStep = WithWorkflow(structWorkflowWithStep)
 )
 
 func simpleWorkflow(ctxt context.Context, input string) (string, error) {
@@ -83,6 +101,18 @@ func simpleWorkflowWithChildWorkflow(ctx context.Context, input string) (string,
 func idempotencyWorkflow(ctx context.Context, input string) (string, error) {
 	idempotencyCounter += 1
 	return input, nil
+}
+
+// complexStructWorkflow processes a StepInputStruct using a step and returns the step result
+func structWorkflowWithStep(ctx context.Context, input StepInputStruct) (StepOutputStruct, error) {
+	return RunAsStep[StepInputStruct, StepOutputStruct](ctx, StepParams{}, simpleStructStep, input)
+}
+
+func simpleStructStep(ctx context.Context, input StepInputStruct) (StepOutputStruct, error) {
+	return StepOutputStruct{
+		Input:    input,
+		StepInfo: "processed by simpleStructStep",
+	}, nil
 }
 
 // Unified struct that demonstrates both pointer and value receiver methods
@@ -414,13 +444,119 @@ func TestWorkflowIdempotency(t *testing.T) {
 	})
 }
 
-/*
-// Check list workflows
-wfList, err := dbos.systemDB.ListWorkflows(context.Background(), ListWorkflowsDBInput{})
-if err != nil {
-	t.Fatalf("failed to list workflows: %v", err)
+func TestWorkflowEncoding(t *testing.T) {
+	setupDBOS(t)
+
+	t.Run("BuiltInType", func(t *testing.T) {
+		// Test a workflow that uses a built-in type (string)
+		handle, err := simpleWf(context.Background(), WorkflowParams{}, "test")
+		if err != nil {
+			t.Fatalf("failed to execute workflow: %v", err)
+		}
+
+		// Block until the workflow completes
+		_, err = handle.GetResult()
+		if err != nil {
+			t.Fatalf("expected no error but got: %v", err)
+		}
+
+		retrieveHandler, err := RetrieveWorkflow[string](handle.GetWorkflowID())
+		if err != nil {
+			t.Fatalf("failed to retrieve workflow: %v", err)
+		}
+		retrievedResult, err := retrieveHandler.GetResult()
+		if err != nil {
+			t.Fatalf("expected no error but got: %v", err)
+		}
+		if retrievedResult != "test" {
+			t.Fatalf("expected retrieved result to be 'test', got %v", retrievedResult)
+		}
+	})
+
+	t.Run("StructType", func(t *testing.T) {
+		// Test a workflow that calls a step with struct types to verify serialization/deserialization
+		input := SimpleStruct{Name: "test", Value: 123}
+		stepInput := StepInputStruct{
+			Data: input,
+			ID:   "step-test",
+		}
+
+		stepHandle, err := structWfWithStep(context.Background(), WorkflowParams{}, stepInput)
+		if err != nil {
+			t.Fatalf("failed to execute step workflow: %v", err)
+		}
+
+		// Block until the workflow completes
+		_, err = stepHandle.GetResult()
+		if err != nil {
+			t.Fatalf("expected no error but got: %v", err)
+		}
+
+		// Test output deserialization from the workflow_status table
+		stepRetrieveHandler, err := RetrieveWorkflow[StepOutputStruct](stepHandle.GetWorkflowID())
+		if err != nil {
+			t.Fatalf("failed to retrieve step workflow: %v", err)
+		}
+		stepRetrievedResult, err := stepRetrieveHandler.GetResult()
+		if err != nil {
+			t.Fatalf("expected no error but got: %v", err)
+		}
+
+		if stepRetrievedResult.Input.ID != stepInput.ID {
+			t.Fatalf("expected step input ID to be %v, got %v", stepInput.ID, stepRetrievedResult.Input.ID)
+		}
+		if stepRetrievedResult.Input.Data.Name != input.Name {
+			t.Fatalf("expected step input data name to be %v, got %v", input.Name, stepRetrievedResult.Input.Data.Name)
+		}
+		if stepRetrievedResult.Input.Data.Value != input.Value {
+			t.Fatalf("expected step input data value to be %v, got %v", input.Value, stepRetrievedResult.Input.Data.Value)
+		}
+		if stepRetrievedResult.StepInfo != "processed by simpleStructStep" {
+			t.Fatalf("expected step info to be 'processed by simpleStructStep', got %v", stepRetrievedResult.StepInfo)
+		}
+
+		// Test input/output deserialization from the workflow_status table
+		workflows, err := getExecutor().systemDB.ListWorkflows(context.Background(), ListWorkflowsDBInput{
+			WorkflowIDs: []string{stepHandle.GetWorkflowID()},
+		})
+		if err != nil {
+			t.Fatalf("failed to list workflows: %v", err)
+		}
+		workflow := workflows[0]
+		if workflow.Input == nil {
+			t.Fatal("expected workflow input to be non-nil")
+		}
+		workflowInput, ok := workflow.Input.(StepInputStruct)
+		if !ok {
+			t.Fatalf("expected workflow input to be of type StepInputStruct, got %T", workflow.Input)
+		}
+		if workflowInput.ID != stepInput.ID {
+			t.Fatalf("expected workflow input ID to be %v, got %v", stepInput.ID, workflowInput.ID)
+		}
+		if workflowInput.Data.Name != input.Name {
+			t.Fatalf("expected workflow input data name to be %v, got %v", input.Name, workflowInput.Data.Name)
+		}
+		if workflowInput.Data.Value != input.Value {
+			t.Fatalf("expected workflow input data value to be %v, got %v", input.Value, workflowInput.Data.Value)
+		}
+
+		workflowOutput, ok := workflow.Output.(StepOutputStruct)
+		if !ok {
+			t.Fatalf("expected workflow output to be of type StepOutputStruct, got %T", workflow.Output)
+		}
+		if workflowOutput.Input.ID != stepInput.ID {
+			t.Fatalf("expected workflow output input ID to be %v, got %v", stepInput.ID, workflowOutput.Input.ID)
+		}
+		if workflowOutput.Input.Data.Name != input.Name {
+			t.Fatalf("expected workflow output input data name to be %v, got %v", input.Name, workflowOutput.Input.Data.Name)
+		}
+		if workflowOutput.Input.Data.Value != input.Value {
+			t.Fatalf("expected workflow output input data value to be %v, got %v", input.Value, workflowOutput.Input.Data.Value)
+		}
+		if workflowOutput.StepInfo != "processed by simpleStructStep" {
+			t.Fatalf("expected workflow output step info to be 'processed by simpleStructStep', got %v", workflowOutput.StepInfo)
+		}
+
+		// TODO: test output deserialization from the operation_results table
+	})
 }
-for _, wf := range wfList {
-	fmt.Printf("Workflow ID: %s, Status: %s\n", wf.ID, wf.Status)
-}
-*/

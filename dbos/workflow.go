@@ -2,6 +2,7 @@ package dbos
 
 import (
 	"context"
+	"encoding/gob"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -121,8 +122,12 @@ type WorkflowParams struct {
 }
 
 func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
-	// Also we should register the wrapped function
 	registerWorkflow(fn)
+	// Registry the input/output types for gob encoding
+	var p P
+	var r R
+	gob.Register(p)
+	gob.Register(r)
 	return func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
 		return runAsWorkflow(ctx, params, fn, input)
 	}
@@ -242,6 +247,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 			}
 			errorChan <- err
 		} else {
+			fmt.Println("workflow function completed successfully, output:", result)
 			recordErr := getExecutor().systemDB.UpdateWorkflowOutcome(dbosWorkflowContext, UpdateWorkflowOutcomeDBInput{workflowID: workflowStatus.ID, status: WorkflowStatusSuccess, output: result})
 			if recordErr != nil {
 				// We cannot return the user code result because we failed to record the output
@@ -307,6 +313,7 @@ func RunAsStep[P any, R any](ctx context.Context, params StepParams, fn StepFunc
 			return *new(R), fmt.Errorf("failed to record step error: %w", err)
 		}
 	} else {
+		fmt.Println("step function completed successfully, output:", stepOutput)
 		err := getExecutor().systemDB.RecordOperationResult(ctx, recordOperationResultDBInput{
 			workflowID:  workflowState.WorkflowID,
 			operationID: stepID,
@@ -318,4 +325,22 @@ func RunAsStep[P any, R any](ctx context.Context, params StepParams, fn StepFunc
 		}
 	}
 	return stepOutput, stepError
+}
+
+/***********************************/
+/******* WORKFLOW MANAGEMENT *******/
+/***********************************/
+
+func RetrieveWorkflow[R any](workflowID string) (workflowPollingHandle[R], error) {
+	ctx := context.Background()
+	workflowStatus, err := getExecutor().systemDB.ListWorkflows(ctx, ListWorkflowsDBInput{
+		WorkflowIDs: []string{workflowID},
+	})
+	if err != nil {
+		return workflowPollingHandle[R]{}, fmt.Errorf("failed to retrieve workflow status: %w", err)
+	}
+	if len(workflowStatus) == 0 {
+		return workflowPollingHandle[R]{}, fmt.Errorf("workflow with ID '%s' not found", workflowID)
+	}
+	return workflowPollingHandle[R]{workflowID: workflowID}, nil
 }
