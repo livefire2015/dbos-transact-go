@@ -643,6 +643,8 @@ func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID str
 			return nil, errors.New(*errorStr) // Assuming errorStr can be converted to an error type
 		case WorkflowStatusCancelled:
 			return nil, fmt.Errorf("workflow %s was cancelled", workflowID)
+		default:
+			time.Sleep(1 * time.Second) // Wait before checking again
 		}
 	}
 }
