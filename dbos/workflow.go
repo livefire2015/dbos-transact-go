@@ -79,6 +79,7 @@ type workflowHandle[R any] struct {
 
 // GetResult waits for the workflow to complete and returns the result
 func (h *workflowHandle[R]) GetResult() (R, error) {
+	// TODO check on channels to see if they are closed
 	select {
 	case result := <-h.resultChan:
 		return result, nil
@@ -114,6 +115,7 @@ func (h *workflowPollingHandle[R]) GetWorkflowID() string {
 /******* WORKFLOW FUNCTIONS *******/
 /**********************************/
 type WorkflowFunc[P any, R any] func(ctx context.Context, input P) (R, error)
+type WorkflowWrapperFunc[P any, R any] func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error)
 
 type WorkflowParams struct {
 	WorkflowID string
@@ -121,19 +123,35 @@ type WorkflowParams struct {
 	Deadline   time.Time
 }
 
-func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
-	registerWorkflow(fn)
+func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R] {
 	// Registry the input/output types for gob encoding
 	var p P
 	var r R
 	gob.Register(p)
 	gob.Register(r)
-	return func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
+
+	wrappedFunction := WorkflowWrapperFunc[P, R](func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
 		return runAsWorkflow(ctx, params, fn, input)
+	})
+	fqdn := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+	typeErasedWrapper := func(ctx context.Context, params WorkflowParams, input any) (WorkflowHandle[any], error) {
+		typedInput, ok := input.(P)
+		if !ok {
+			return nil, fmt.Errorf("invalid input type for workflow %s", fqdn)
+		}
+		handle, err := wrappedFunction(ctx, params, typedInput)
+		if err != nil {
+			return nil, err
+		}
+		return &workflowPollingHandle[any]{workflowID: handle.GetWorkflowID()}, nil
 	}
+	registerWorkflow(fqdn, typeErasedWrapper)
+
+	return wrappedFunction
 }
 
 func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) (WorkflowHandle[R], error) {
+	fmt.Println("Running workflow function:", runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(), "with params:", params)
 	// First, create a context for the workflow
 	dbosWorkflowContext := context.Background()
 
@@ -157,14 +175,17 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	}
 
 	workflowStatus := WorkflowStatus{
-		Status:        WorkflowStatusPending,
-		ID:            workflowID,
-		CreatedAt:     time.Now(),
-		Deadline:      params.Deadline,
-		Timeout:       params.Timeout,
-		Input:         input,
-		ApplicationID: nil, // TODO: set application ID if available
-		QueueName:     nil, // TODO: set queue name if available
+		Name:               runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(), // XXX the interface approach would encapsulate this
+		ApplicationVersion: APP_VERSION,
+		ExecutorID:         EXECUTOR_ID,
+		Status:             WorkflowStatusPending,
+		ID:                 workflowID,
+		CreatedAt:          time.Now(),
+		Deadline:           params.Deadline,
+		Timeout:            params.Timeout,
+		Input:              input,
+		ApplicationID:      nil, // TODO: set application ID if available
+		QueueName:          nil, // TODO: set queue name if available
 	}
 
 	// TODO: before init status, check if we are recovering a child workflow, and return a (DB) handle for it.

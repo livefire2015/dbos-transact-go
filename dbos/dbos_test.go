@@ -60,7 +60,8 @@ var (
 		return prefix + in, nil
 	})
 	// Workflow for idempotency testing
-	idempotencyWf = WithWorkflow(idempotencyWorkflow)
+	idempotencyWf         = WithWorkflow(idempotencyWorkflow)
+	idempotencyWfWithStep = WithWorkflow(idempotencyWorkflowWithStep)
 	// Workflow for struct encoding testing
 	structWfWithStep = WithWorkflow(structWorkflowWithStep)
 )
@@ -101,6 +102,25 @@ func simpleWorkflowWithChildWorkflow(ctx context.Context, input string) (string,
 func idempotencyWorkflow(ctx context.Context, input string) (string, error) {
 	idempotencyCounter += 1
 	return input, nil
+}
+
+func blockingStep(ctx context.Context, input string) (string, error) {
+	for {
+	}
+	return "", nil
+}
+
+type idempotencyWorkflowWithStepsParams struct {
+	Event *Event
+	Input string
+}
+
+func idempotencyWorkflowWithStep(ctx context.Context, input idempotencyWorkflowWithStepsParams) (int, error) {
+	RunAsStep(ctx, StepParams{}, idempotencyWorkflow, input.Input)
+	fmt.Println(input.Event.cond)
+	input.Event.Set()
+	RunAsStep(ctx, StepParams{}, blockingStep, input.Input)
+	return int(idempotencyCounter), nil
 }
 
 // complexStructWorkflow processes a StepInputStruct using a step and returns the step result
@@ -563,51 +583,22 @@ func TestWorkflowEncoding(t *testing.T) {
 func TestWorkflowRecovery(t *testing.T) {
 	setupDBOS(t)
 
-	// Recovering a pending workflow restart where it left off
-	// Test recovery of specified executor only
-	// Test recovery of specific version only
-	// Test recovery reach max recovery attempts
 	t.Run("RecoveryResumeWhereItLeftOff", func(t *testing.T) {
-
-		// TODO have this use a step
 
 		// Reset the global counter
 		idempotencyCounter = 0
 
-		workflowID := uuid.NewString()
-		input := "recovery-test"
-
 		// First execution - run the workflow once
-		handle1, err := idempotencyWf(context.Background(), WorkflowParams{WorkflowID: workflowID}, input)
+		input := idempotencyWorkflowWithStepsParams{
+			Event: NewEvent(),
+			Input: "recovery-test",
+		}
+		handle1, err := idempotencyWfWithStep(context.Background(), WorkflowParams{}, input)
 		if err != nil {
 			t.Fatalf("failed to execute workflow first time: %v", err)
 		}
 
-		// Wait for completion and get result
-		result1, err := handle1.GetResult()
-		if err != nil {
-			t.Fatalf("failed to get result from first execution: %v", err)
-		}
-
-		// expectedResult := fmt.Sprintf("step-result-%s", input)
-		expectedResult := input
-		if result1 != expectedResult {
-			t.Fatalf("expected result %v but got %v", expectedResult, result1)
-		}
-
-		// Verify the counter was incremented once
-		if idempotencyCounter != 1 {
-			t.Fatalf("expected counter to be 1 after first execution, but got %d", idempotencyCounter)
-		}
-
-		// Reset workflow status back to PENDING to simulate recovery scenario
-		err = getExecutor().systemDB.UpdateWorkflowOutcome(context.Background(), UpdateWorkflowOutcomeDBInput{
-			workflowID: workflowID,
-			status:     WorkflowStatusPending,
-		})
-		if err != nil {
-			t.Fatalf("failed to reset workflow status to PENDING: %v", err)
-		}
+		input.Event.Wait() // Wait for the first step to complete. The second spins forever.
 
 		// Run recovery for pending workflows with "local" executor
 		recoveredHandles, err := recoverPendingWorkflows(context.Background(), []string{"local"})
@@ -626,25 +617,14 @@ func TestWorkflowRecovery(t *testing.T) {
 			t.Fatalf("expected recovered workflow ID %s, got %s", handle1.GetWorkflowID(), recoveredHandle.GetWorkflowID())
 		}
 
-		// Wait for recovery to complete
-		result2, err := recoveredHandle.GetResult()
-		if err != nil {
-			t.Fatalf("failed to get result from recovered execution: %v", err)
-		}
-
-		// Ensure the result is the same
-		if result2 != result1 {
-			t.Fatalf("expected recovered result %v to match original result %v", result2, result1)
-		}
-
-		// Ensure that the idempotency counter wasn't incremented again
+		// Check that the first step was *not* re-executed (idempotency counter is still 1)
 		if idempotencyCounter != 1 {
 			t.Fatalf("expected counter to remain 1 after recovery (idempotent), but got %d", idempotencyCounter)
 		}
 
 		// Using ListWorkflows, retrieve the status of the workflow
 		workflows, err := getExecutor().systemDB.ListWorkflows(context.Background(), ListWorkflowsDBInput{
-			WorkflowIDs: []string{workflowID},
+			WorkflowIDs: []string{handle1.GetWorkflowID()},
 		})
 		if err != nil {
 			t.Fatalf("failed to list workflows: %v", err)
@@ -656,25 +636,15 @@ func TestWorkflowRecovery(t *testing.T) {
 
 		workflow := workflows[0]
 
-		// Ensure that its status is SUCCESS
-		if workflow.Status != WorkflowStatusSuccess {
-			t.Fatalf("expected workflow status to be SUCCESS, got %s", workflow.Status)
-		}
-
 		// Ensure its number of attempts is 2
 		if workflow.Attempts != 2 {
 			t.Fatalf("expected workflow attempts to be 2, got %d", workflow.Attempts)
 		}
-
-		// Ensure its output is the same as the output of the first invocation
-		workflowOutput, ok := workflow.Output.(string)
-		if !ok {
-			t.Fatalf("expected workflow output to be string, got %T", workflow.Output)
-		}
-		if workflowOutput != expectedResult {
-			t.Fatalf("expected workflow output %v, got %v", expectedResult, workflowOutput)
-		}
 	})
+
+	// Test recovery of specified executor only
+	// Test recovery of specific version only
+	// Test recovery reach max recovery attempts
 }
 
 /*

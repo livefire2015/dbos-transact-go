@@ -1,18 +1,18 @@
 package dbos
 
 import (
+	"context"
 	"fmt"
-	"reflect"
-	"runtime"
 	"sync"
 )
 
-var registry = make(map[string]any)
+type TypedErasedWorkflowWrapperFunc func(ctx context.Context, params WorkflowParams, input any) (WorkflowHandle[any], error)
+
+var registry = make(map[string]TypedErasedWorkflowWrapperFunc)
 var regMutex sync.RWMutex
 
 // Register adds a workflow function to the registry (thread-safe, only once per name)
-func registerWorkflow(fn any) {
-	fqdn := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+func registerWorkflow(fqdn string, fn TypedErasedWorkflowWrapperFunc) {
 	regMutex.Lock()
 	defer regMutex.Unlock()
 
