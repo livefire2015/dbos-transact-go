@@ -406,14 +406,15 @@ func (s *systemDatabase) RecordChildWorkflow(ctx context.Context, input RecordCh
 
 // ListWorkflowsInput represents the input parameters for listing workflows
 type ListWorkflowsDBInput struct {
-	WorkflowName       *string
-	WorkflowIDPrefix   *string
+	WorkflowName       string
+	WorkflowIDPrefix   string
 	WorkflowIDs        []string
-	AuthenticatedUser  *string
+	AuthenticatedUser  string
 	StartTime          time.Time
 	EndTime            time.Time
-	Status             *string
-	ApplicationVersion *string
+	Status             WorkflowStatusType
+	ApplicationVersion string
+	ExecutorIDs        []string
 	Limit              *int
 	Offset             *int
 	SortDesc           bool
@@ -432,17 +433,17 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	          FROM dbos.workflow_status`
 
 	// Add filters using query builder
-	if input.WorkflowName != nil {
-		qb.addWhere("name", *input.WorkflowName)
+	if input.WorkflowName != "" {
+		qb.addWhere("name", input.WorkflowName)
 	}
-	if input.WorkflowIDPrefix != nil {
-		qb.addWhereLike("workflow_uuid", *input.WorkflowIDPrefix+"%")
+	if input.WorkflowIDPrefix != "" {
+		qb.addWhereLike("workflow_uuid", input.WorkflowIDPrefix+"%")
 	}
 	if input.WorkflowIDs != nil && len(input.WorkflowIDs) > 0 {
 		qb.addWhereAny("workflow_uuid", input.WorkflowIDs)
 	}
-	if input.AuthenticatedUser != nil {
-		qb.addWhere("authenticated_user", *input.AuthenticatedUser)
+	if input.AuthenticatedUser != "" {
+		qb.addWhere("authenticated_user", input.AuthenticatedUser)
 	}
 	if !input.StartTime.IsZero() {
 		qb.addWhereGreaterEqual("created_at", input.StartTime.UnixMilli())
@@ -450,11 +451,14 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	if !input.EndTime.IsZero() {
 		qb.addWhereLessEqual("created_at", input.EndTime.UnixMilli())
 	}
-	if input.Status != nil {
-		qb.addWhere("status", *input.Status)
+	if input.Status != "" {
+		qb.addWhere("status", input.Status)
 	}
-	if input.ApplicationVersion != nil {
-		qb.addWhere("application_version", *input.ApplicationVersion)
+	if input.ApplicationVersion != "" {
+		qb.addWhere("application_version", input.ApplicationVersion)
+	}
+	if input.ExecutorIDs != nil && len(input.ExecutorIDs) > 0 {
+		qb.addWhereAny("executor_id", input.ExecutorIDs)
 	}
 
 	// Build complete query

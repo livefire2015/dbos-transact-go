@@ -35,10 +35,10 @@ type WorkflowStatus struct {
 	AuthenticatedRoles *string            `json:"authenticated_roles"`
 	Output             any                `json:"output"`
 	Error              error              `json:"error"`
-	ExecutorID         *string            `json:"executor_id"`
+	ExecutorID         string             `json:"executor_id"`
 	CreatedAt          time.Time          `json:"created_at"`
 	UpdatedAt          time.Time          `json:"updated_at"`
-	ApplicationVersion *string            `json:"application_version"`
+	ApplicationVersion string             `json:"application_version"`
 	ApplicationID      *string            `json:"application_id"`
 	Attempts           int                `json:"attempts"`
 	QueueName          *string            `json:"queue_name"`
