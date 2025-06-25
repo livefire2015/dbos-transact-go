@@ -23,7 +23,7 @@ CREATE TABLE dbos.workflow_status (
     application_id TEXT,
     class_name VARCHAR(255) DEFAULT NULL,
     config_name VARCHAR(255) DEFAULT NULL,
-    attempts BIGINT DEFAULT 0,
+    recovery_attempts BIGINT DEFAULT 0,
     queue_name TEXT,
     workflow_timeout_ms BIGINT,
     workflow_deadline_epoch_ms BIGINT,

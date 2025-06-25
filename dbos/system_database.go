@@ -26,6 +26,7 @@ import (
 
 type SystemDatabase interface {
 	Destroy()
+	ResetSystemDB(ctx context.Context) error
 	InsertWorkflowStatus(ctx context.Context, input InsertWorkflowStatusDBInput) (*InsertWorkflowResult, error)
 	RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error
 	RecordChildWorkflow(ctx context.Context, input RecordChildWorkflowDBInput) error
@@ -55,9 +56,9 @@ func createDatabaseIfNotExists(databaseURL string) error {
 		return fmt.Errorf("database name not found in URL")
 	}
 
-	serverURL := *parsedURL
+	serverURL := parsedURL.Copy()
 	serverURL.Database = "postgres"
-	conn, err := pgx.ConnectConfig(context.Background(), &serverURL)
+	conn, err := pgx.ConnectConfig(context.Background(), serverURL)
 	if err != nil {
 		return fmt.Errorf("failed to connect to PostgreSQL server: %w", err)
 	}
@@ -220,7 +221,7 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
         application_version,
         application_id,
         created_at,
-        attempts,
+        recovery_attempts,
         updated_at,
         workflow_timeout_ms,
         workflow_deadline_epoch_ms,
@@ -230,10 +231,10 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
     ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
-            attempts = workflow_status.attempts + 1,
+            recovery_attempts = workflow_status.recovery_attempts + 1,
             updated_at = EXCLUDED.updated_at,
             executor_id = EXCLUDED.executor_id
-        RETURNING attempts, status, name, queue_name, workflow_deadline_epoch_ms`
+        RETURNING recovery_attempts, status, name, queue_name, workflow_deadline_epoch_ms`
 
 	var result InsertWorkflowResult
 	var err error
@@ -415,7 +416,7 @@ type ListWorkflowsDBInput struct {
 	AuthenticatedUser  string
 	StartTime          time.Time
 	EndTime            time.Time
-	Status             WorkflowStatusType
+	Status             []WorkflowStatusType
 	ApplicationVersion string
 	ExecutorIDs        []string
 	Limit              *int
@@ -431,7 +432,7 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	// Build the base query
 	baseQuery := `SELECT workflow_uuid, status, name, authenticated_user, assumed_role, authenticated_roles,
 	                 output, error, executor_id, created_at, updated_at, application_version, application_id,
-	                 attempts, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
+	                 recovery_attempts, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
 					 deduplication_id, inputs, priority
 	          FROM dbos.workflow_status`
 
@@ -454,8 +455,8 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	if !input.EndTime.IsZero() {
 		qb.addWhereLessEqual("created_at", input.EndTime.UnixMilli())
 	}
-	if input.Status != "" {
-		qb.addWhere("status", input.Status)
+	if len(input.Status) > 0 {
+		qb.addWhereAny("status", input.Status)
 	}
 	if input.ApplicationVersion != "" {
 		qb.addWhere("application_version", input.ApplicationVersion)
@@ -731,6 +732,43 @@ func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID str
 /*******************************/
 /******* UTILS ********/
 /*******************************/
+
+func (s *systemDatabase) ResetSystemDB(ctx context.Context) error {
+	// Get the current database configuration from the pool
+	config := s.pool.Config()
+	if config == nil || config.ConnConfig == nil {
+		return fmt.Errorf("failed to get pool configuration")
+	}
+
+	// Extract the database name before closing the pool
+	dbName := config.ConnConfig.Database
+	if dbName == "" {
+		return fmt.Errorf("database name not found in pool configuration")
+	}
+
+	// Close the current pool before dropping the database
+	s.pool.Close()
+
+	// Create a new connection configuration pointing to the postgres database
+	postgresConfig := config.ConnConfig.Copy()
+	postgresConfig.Database = "postgres"
+
+	// Connect to the postgres database
+	conn, err := pgx.ConnectConfig(ctx, postgresConfig)
+	if err != nil {
+		return fmt.Errorf("failed to connect to PostgreSQL server: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	// Drop the database
+	dropSQL := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", pgx.Identifier{dbName}.Sanitize())
+	_, err = conn.Exec(ctx, dropSQL)
+	if err != nil {
+		return fmt.Errorf("failed to drop database %s: %w", dbName, err)
+	}
+
+	return nil
+}
 
 type queryBuilder struct {
 	setClauses   []string
