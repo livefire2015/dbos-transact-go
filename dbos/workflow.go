@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -115,15 +116,24 @@ func (h *workflowPollingHandle[R]) GetWorkflowID() string {
 }
 
 /**********************************/
-/******* WORKFLOW FUNCTIONS *******/
+/******* WORKFLOW REGISTRY *******/
 /**********************************/
-type WorkflowFunc[P any, R any] func(ctx context.Context, input P) (R, error)
-type WorkflowWrapperFunc[P any, R any] func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error)
+type TypedErasedWorkflowWrapperFunc func(ctx context.Context, params WorkflowParams, input any) (WorkflowHandle[any], error)
 
-type WorkflowParams struct {
-	WorkflowID string
-	Timeout    time.Duration
-	Deadline   time.Time
+var registry = make(map[string]TypedErasedWorkflowWrapperFunc)
+var regMutex sync.RWMutex
+
+// Register adds a workflow function to the registry (thread-safe, only once per name)
+func registerWorkflow(fqdn string, fn TypedErasedWorkflowWrapperFunc) {
+	regMutex.Lock()
+	defer regMutex.Unlock()
+
+	if _, exists := registry[fqdn]; exists {
+		// TODO: consider printing a warning instead of panicking
+		panic(fmt.Sprintf("workflow function '%s' is already registered", fqdn))
+	}
+
+	registry[fqdn] = fn
 }
 
 func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R] {
@@ -133,9 +143,12 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R]
 	gob.Register(p)
 	gob.Register(r)
 
+	// Wrap the function in a durable workflow
 	wrappedFunction := WorkflowWrapperFunc[P, R](func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
 		return runAsWorkflow(ctx, params, fn, input)
 	})
+
+	// Register a type-erased version of the durable workflow for recovery
 	fqdn := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
 	typeErasedWrapper := func(ctx context.Context, params WorkflowParams, input any) (WorkflowHandle[any], error) {
 		typedInput, ok := input.(P)
@@ -151,6 +164,18 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R]
 	registerWorkflow(fqdn, typeErasedWrapper)
 
 	return wrappedFunction
+}
+
+/**********************************/
+/******* WORKFLOW FUNCTIONS *******/
+/**********************************/
+type WorkflowFunc[P any, R any] func(ctx context.Context, input P) (R, error)
+type WorkflowWrapperFunc[P any, R any] func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error)
+
+type WorkflowParams struct {
+	WorkflowID string
+	Timeout    time.Duration
+	Deadline   time.Time
 }
 
 func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) (WorkflowHandle[R], error) {

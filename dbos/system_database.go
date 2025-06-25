@@ -26,6 +26,7 @@ import (
 
 type SystemDatabase interface {
 	Destroy()
+	ResetSystemDB(ctx context.Context) error
 	InsertWorkflowStatus(ctx context.Context, input InsertWorkflowStatusDBInput) (*InsertWorkflowResult, error)
 	RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error
 	RecordChildWorkflow(ctx context.Context, input RecordChildWorkflowDBInput) error
@@ -55,9 +56,9 @@ func createDatabaseIfNotExists(databaseURL string) error {
 		return fmt.Errorf("database name not found in URL")
 	}
 
-	serverURL := *parsedURL
+	serverURL := parsedURL.Copy()
 	serverURL.Database = "postgres"
-	conn, err := pgx.ConnectConfig(context.Background(), &serverURL)
+	conn, err := pgx.ConnectConfig(context.Background(), serverURL)
 	if err != nil {
 		return fmt.Errorf("failed to connect to PostgreSQL server: %w", err)
 	}
@@ -731,6 +732,54 @@ func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID str
 /*******************************/
 /******* UTILS ********/
 /*******************************/
+
+func (s *systemDatabase) ResetSystemDB(ctx context.Context) error {
+	// Get the current database configuration from the pool
+	config := s.pool.Config()
+	if config == nil || config.ConnConfig == nil {
+		return fmt.Errorf("failed to get pool configuration")
+	}
+
+	// Extract the database name before closing the pool
+	dbName := config.ConnConfig.Database
+	if dbName == "" {
+		return fmt.Errorf("database name not found in pool configuration")
+	}
+
+	// Close the current pool before dropping the database
+	s.pool.Close()
+
+	// Create a new connection configuration pointing to the postgres database
+	postgresConfig := config.ConnConfig.Copy()
+	postgresConfig.Database = "postgres"
+
+	// Connect to the postgres database
+	conn, err := pgx.ConnectConfig(ctx, postgresConfig)
+	if err != nil {
+		return fmt.Errorf("failed to connect to PostgreSQL server: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	// Terminate all existing connections to the target database
+	terminateQuery := `
+		SELECT pg_terminate_backend(pid)
+		FROM pg_stat_activity
+		WHERE datname = $1 AND pid <> pg_backend_pid()`
+
+	_, err = conn.Exec(ctx, terminateQuery, dbName)
+	if err != nil {
+		return fmt.Errorf("failed to terminate connections to database %s: %w", dbName, err)
+	}
+
+	// Drop the database
+	dropSQL := fmt.Sprintf("DROP DATABASE IF EXISTS %s", pgx.Identifier{dbName}.Sanitize())
+	_, err = conn.Exec(ctx, dropSQL)
+	if err != nil {
+		return fmt.Errorf("failed to drop database %s: %w", dbName, err)
+	}
+
+	return nil
+}
 
 type queryBuilder struct {
 	setClauses   []string
