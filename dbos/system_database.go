@@ -221,7 +221,7 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
         application_version,
         application_id,
         created_at,
-        attempts,
+        recovery_attempts,
         updated_at,
         workflow_timeout_ms,
         workflow_deadline_epoch_ms,
@@ -231,10 +231,10 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
     ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
-            attempts = workflow_status.attempts + 1,
+            recovery_attempts = workflow_status.recovery_attempts + 1,
             updated_at = EXCLUDED.updated_at,
             executor_id = EXCLUDED.executor_id
-        RETURNING attempts, status, name, queue_name, workflow_deadline_epoch_ms`
+        RETURNING recovery_attempts, status, name, queue_name, workflow_deadline_epoch_ms`
 
 	var result InsertWorkflowResult
 	var err error
@@ -432,7 +432,7 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	// Build the base query
 	baseQuery := `SELECT workflow_uuid, status, name, authenticated_user, assumed_role, authenticated_roles,
 	                 output, error, executor_id, created_at, updated_at, application_version, application_id,
-	                 attempts, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
+	                 recovery_attempts, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
 					 deduplication_id, inputs, priority
 	          FROM dbos.workflow_status`
 
