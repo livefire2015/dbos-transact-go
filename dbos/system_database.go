@@ -416,7 +416,7 @@ type ListWorkflowsDBInput struct {
 	AuthenticatedUser  string
 	StartTime          time.Time
 	EndTime            time.Time
-	Status             WorkflowStatusType
+	Status             []WorkflowStatusType
 	ApplicationVersion string
 	ExecutorIDs        []string
 	Limit              *int
@@ -455,8 +455,8 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 	if !input.EndTime.IsZero() {
 		qb.addWhereLessEqual("created_at", input.EndTime.UnixMilli())
 	}
-	if input.Status != "" {
-		qb.addWhere("status", input.Status)
+	if len(input.Status) > 0 {
+		qb.addWhereAny("status", input.Status)
 	}
 	if input.ApplicationVersion != "" {
 		qb.addWhere("application_version", input.ApplicationVersion)

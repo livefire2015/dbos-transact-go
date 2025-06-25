@@ -10,7 +10,7 @@ func recoverPendingWorkflows(ctx context.Context, executorIDs []string) ([]Workf
 	workflowHandles := make([]WorkflowHandle[any], 0)
 	// List pending workflows for the executors
 	pendingWorkflows, err := getExecutor().systemDB.ListWorkflows(ctx, ListWorkflowsDBInput{
-		Status:             WorkflowStatusPending,
+		Status:             []WorkflowStatusType{WorkflowStatusPending},
 		ExecutorIDs:        executorIDs,
 		ApplicationVersion: APP_VERSION,
 	})
