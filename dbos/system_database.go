@@ -561,9 +561,8 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 			dec := gob.NewDecoder(buf)
 			var output any
 			if err := dec.Decode(&output); err != nil {
-				// If deserialization fails, log the error but continue (don't fail the entire query)
-				fmt.Printf("Warning: failed to decode output for workflow %s: %v\n", wf.ID, err)
-				wf.Output = nil
+				// If deserialization fails, record the error
+				wf.Output = fmt.Sprintf("Failed to decode output: %v", err)
 			} else {
 				wf.Output = output
 			}
@@ -578,9 +577,8 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 			dec := gob.NewDecoder(buf)
 			var input any
 			if err := dec.Decode(&input); err != nil {
-				// If deserialization fails, log the error but continue (don't fail the entire query)
-				fmt.Printf("Warning: failed to decode input for workflow %s: %v\n", wf.ID, err)
-				wf.Input = nil
+				// If deserialization fails, record the error
+				wf.Input = fmt.Sprintf("Failed to decode input: %v", err)
 			} else {
 				wf.Input = input
 			}
