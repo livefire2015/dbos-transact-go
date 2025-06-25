@@ -14,7 +14,7 @@ CREATE TABLE dbos.workflow_status (
     authenticated_user TEXT,
     assumed_role TEXT,
     authenticated_roles TEXT,
-    output BYTEA,
+    output TEXT,
     error TEXT,
     executor_id TEXT,
     created_at BIGINT NOT NULL DEFAULT (EXTRACT(epoch FROM now()) * 1000::numeric)::bigint,
@@ -29,7 +29,7 @@ CREATE TABLE dbos.workflow_status (
     workflow_deadline_epoch_ms BIGINT,
     started_at_epoch_ms BIGINT,
     deduplication_id TEXT,
-    inputs BYTEA,
+    inputs TEXT,
     priority INTEGER NOT NULL DEFAULT 0
 );
 
@@ -48,7 +48,7 @@ CREATE TABLE dbos.operation_outputs (
     workflow_uuid TEXT NOT NULL,
     function_id INTEGER NOT NULL,
     function_name TEXT NOT NULL DEFAULT '',
-    output BYTEA,
+    output TEXT,
     error TEXT,
     child_workflow_id TEXT,
     PRIMARY KEY (workflow_uuid, function_id),

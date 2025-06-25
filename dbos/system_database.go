@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -204,6 +205,7 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
 		}
 		inputBytes = buf.Bytes()
 	}
+	inputString := base64.StdEncoding.EncodeToString(inputBytes)
 
 	// TODO do not update executor_id when enqueuing a workflow
 	query := `INSERT INTO dbos.workflow_status (
@@ -253,7 +255,7 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
 			updatedAt.UnixMilli(),
 			timeoutMs,
 			deadline,
-			inputBytes,
+			inputString,
 			initStatus.DeduplicationID,
 			initStatus.Priority,
 		).Scan(
@@ -280,7 +282,7 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
 			updatedAt.UnixMilli(),
 			timeoutMs,
 			deadline,
-			inputBytes,
+			inputString,
 			initStatus.DeduplicationID,
 			initStatus.Priority,
 		).Scan(
@@ -337,11 +339,12 @@ func (s *systemDatabase) RecordOperationResult(ctx context.Context, input record
 		}
 		outputBytes = buf.Bytes()
 	}
+	outputString := base64.StdEncoding.EncodeToString(outputBytes)
 
 	commandTag, err := s.pool.Exec(ctx, query,
 		input.workflowID,
 		input.operationID,
-		outputBytes,
+		outputString,
 		errorString,
 		input.operationName,
 	)
@@ -510,16 +513,16 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 		var createdAtMs, updatedAtMs int64
 		var timeoutMs *int64
 		var deadlineMs, startedAtMs *int64
-		var outputBytes, inputBytes []byte
+		var outputString, inputString *string
 		var errorStr *string
 
 		err := rows.Scan(
 			&wf.ID, &wf.Status, &wf.Name, &wf.AuthenticatedUser, &wf.AssumedRole,
-			&wf.AuthenticatedRoles, &outputBytes, &errorStr, &wf.ExecutorID, &createdAtMs,
+			&wf.AuthenticatedRoles, &outputString, &errorStr, &wf.ExecutorID, &createdAtMs,
 			&updatedAtMs, &wf.ApplicationVersion, &wf.ApplicationID,
 			&wf.Attempts, &wf.QueueName, &timeoutMs,
 			&deadlineMs, &startedAtMs, &wf.DeduplicationID,
-			&inputBytes, &wf.Priority,
+			&inputString, &wf.Priority,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan workflow row: %w", err)
@@ -549,8 +552,11 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 			wf.Error = errors.New(*errorStr)
 		}
 
-		// Deserialize output from BYTEA using gob
-		if outputBytes != nil && len(outputBytes) > 0 {
+		if outputString != nil && len(*outputString) > 0 {
+			outputBytes, err := base64.StdEncoding.DecodeString(*outputString)
+			if err != nil {
+				return nil, err
+			}
 			buf := bytes.NewBuffer(outputBytes)
 			dec := gob.NewDecoder(buf)
 			var output any
@@ -563,8 +569,11 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 			}
 		}
 
-		// Deserialize input from BYTEA using gob
-		if inputBytes != nil && len(inputBytes) > 0 {
+		if inputString != nil && len(*inputString) > 0 {
+			inputBytes, err := base64.StdEncoding.DecodeString(*inputString)
+			if err != nil {
+				return nil, err
+			}
 			buf := bytes.NewBuffer(inputBytes)
 			dec := gob.NewDecoder(buf)
 			var input any
@@ -611,6 +620,7 @@ func (s *systemDatabase) UpdateWorkflowOutcome(ctx context.Context, input Update
 		}
 		outputBytes = buf.Bytes()
 	}
+	outputString := base64.StdEncoding.EncodeToString(outputBytes)
 
 	var errorStr string
 	if input.err != nil {
@@ -619,9 +629,9 @@ func (s *systemDatabase) UpdateWorkflowOutcome(ctx context.Context, input Update
 
 	var err error
 	if input.tx != nil {
-		_, err = input.tx.Exec(ctx, query, input.status, outputBytes, errorStr, time.Now().UnixMilli(), input.workflowID)
+		_, err = input.tx.Exec(ctx, query, input.status, outputString, errorStr, time.Now().UnixMilli(), input.workflowID)
 	} else {
-		_, err = s.pool.Exec(ctx, query, input.status, outputBytes, errorStr, time.Now().UnixMilli(), input.workflowID)
+		_, err = s.pool.Exec(ctx, query, input.status, outputString, errorStr, time.Now().UnixMilli(), input.workflowID)
 	}
 
 	if err != nil {
@@ -682,9 +692,9 @@ func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID str
 	var status WorkflowStatusType
 	for {
 		row := s.pool.QueryRow(ctx, query, workflowID)
-		var outputBytes []byte
+		var outputString *string
 		var errorStr *string
-		err := row.Scan(&status, &outputBytes, &errorStr)
+		err := row.Scan(&status, &outputString, &errorStr)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				time.Sleep(1 * time.Second)
@@ -695,8 +705,12 @@ func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID str
 
 		switch status {
 		case WorkflowStatusSuccess:
-			// Deserialize output from BYTEA using gob
-			if outputBytes != nil && len(outputBytes) > 0 {
+			// Deserialize output from TEXT to bytes then from bytes to R using gob
+			if outputString != nil && len(*outputString) > 0 {
+				outputBytes, err := base64.StdEncoding.DecodeString(*outputString)
+				if err != nil {
+					return nil, err
+				}
 				buf := bytes.NewBuffer(outputBytes)
 				dec := gob.NewDecoder(buf)
 				var output any

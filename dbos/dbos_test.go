@@ -104,23 +104,20 @@ func idempotencyWorkflow(ctx context.Context, input string) (string, error) {
 	return input, nil
 }
 
+var blockingStepStopEvent *Event
+
 func blockingStep(ctx context.Context, input string) (string, error) {
-	for {
-	}
+	blockingStepStopEvent.Wait()
 	return "", nil
 }
 
-type idempotencyWorkflowWithStepsParams struct {
-	Event *Event
-	Input string
-}
+var idempotencyWorkflowWithStepEvent *Event
 
-func idempotencyWorkflowWithStep(ctx context.Context, input idempotencyWorkflowWithStepsParams) (int, error) {
-	RunAsStep(ctx, StepParams{}, idempotencyWorkflow, input.Input)
-	fmt.Println(input.Event.cond)
-	input.Event.Set()
-	RunAsStep(ctx, StepParams{}, blockingStep, input.Input)
-	return int(idempotencyCounter), nil
+func idempotencyWorkflowWithStep(ctx context.Context, input string) (int64, error) {
+	RunAsStep(ctx, StepParams{}, idempotencyWorkflow, input)
+	idempotencyWorkflowWithStepEvent.Set()
+	RunAsStep(ctx, StepParams{}, blockingStep, input)
+	return idempotencyCounter, nil
 }
 
 // complexStructWorkflow processes a StepInputStruct using a step and returns the step result
@@ -589,16 +586,15 @@ func TestWorkflowRecovery(t *testing.T) {
 		idempotencyCounter = 0
 
 		// First execution - run the workflow once
-		input := idempotencyWorkflowWithStepsParams{
-			Event: NewEvent(),
-			Input: "recovery-test",
-		}
+		input := "recovery-test"
+		idempotencyWorkflowWithStepEvent = NewEvent()
+		blockingStepStopEvent = NewEvent()
 		handle1, err := idempotencyWfWithStep(context.Background(), WorkflowParams{}, input)
 		if err != nil {
 			t.Fatalf("failed to execute workflow first time: %v", err)
 		}
 
-		input.Event.Wait() // Wait for the first step to complete. The second spins forever.
+		idempotencyWorkflowWithStepEvent.Wait() // Wait for the first step to complete. The second spins forever.
 
 		// Run recovery for pending workflows with "local" executor
 		recoveredHandles, err := recoverPendingWorkflows(context.Background(), []string{"local"})
@@ -640,6 +636,17 @@ func TestWorkflowRecovery(t *testing.T) {
 		if workflow.Attempts != 2 {
 			t.Fatalf("expected workflow attempts to be 2, got %d", workflow.Attempts)
 		}
+
+		// unlock the workflow & wait for result
+		blockingStepStopEvent.Set() // This will allow the blocking step to complete
+		result, err := recoveredHandle.GetResult()
+		if err != nil {
+			t.Fatalf("failed to get result from recovered handle: %v", err)
+		}
+		if result != idempotencyCounter {
+			t.Fatalf("expected result to be %s, got %s", input, result)
+		}
+
 	})
 
 	// Test recovery of specified executor only

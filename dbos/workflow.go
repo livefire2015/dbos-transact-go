@@ -100,11 +100,14 @@ type workflowPollingHandle[R any] struct {
 func (h *workflowPollingHandle[R]) GetResult() (R, error) {
 	ctx := context.Background()
 	result, err := getExecutor().systemDB.AwaitWorkflowResult(ctx, h.workflowID)
-	typedResult, ok := result.(R)
-	if !ok {
-		return *new(R), fmt.Errorf("failed to cast workflow result to expected type %T", typedResult)
+	if result != nil {
+		typedResult, ok := result.(R)
+		if !ok {
+			return *new(R), fmt.Errorf("failed to cast workflow result to expected type %T", typedResult)
+		}
+		return typedResult, err
 	}
-	return typedResult, err
+	return *new(R), err
 }
 
 func (h *workflowPollingHandle[R]) GetWorkflowID() string {
@@ -206,6 +209,8 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	if err != nil {
 		return nil, fmt.Errorf("inserting workflow status: %w", err)
 	}
+
+	fmt.Println(insertStatusResult)
 
 	switch insertStatusResult.Status {
 	case WorkflowStatusSuccess, WorkflowStatusError:
@@ -321,25 +326,24 @@ func RunAsStep[P any, R any](ctx context.Context, params StepParams, fn StepFunc
 	// Get next step ID
 	stepID := workflowState.NextStepID()
 
+	dbInput := recordOperationResultDBInput{
+		workflowID:    workflowState.WorkflowID,
+		operationName: runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(),
+		operationID:   stepID,
+	}
 	stepOutput, stepError := fn(ctx, input)
 	if stepError != nil {
 		fmt.Println("step function returned an error:", stepError)
-		err := getExecutor().systemDB.RecordOperationResult(ctx, recordOperationResultDBInput{
-			workflowID:  workflowState.WorkflowID,
-			operationID: stepID,
-			err:         stepError,
-		})
+		dbInput.err = stepError
+		err := getExecutor().systemDB.RecordOperationResult(ctx, dbInput)
 		if err != nil {
 			fmt.Println("failed to record step error:", err)
 			return *new(R), fmt.Errorf("failed to record step error: %w", err)
 		}
 	} else {
 		fmt.Println("step function completed successfully, output:", stepOutput)
-		err := getExecutor().systemDB.RecordOperationResult(ctx, recordOperationResultDBInput{
-			workflowID:  workflowState.WorkflowID,
-			operationID: stepID,
-			output:      stepOutput,
-		})
+		dbInput.output = stepOutput
+		err := getExecutor().systemDB.RecordOperationResult(ctx, dbInput)
 		if err != nil {
 			fmt.Println("failed to record step output:", err)
 			return *new(R), fmt.Errorf("failed to record step output: %w", err)
