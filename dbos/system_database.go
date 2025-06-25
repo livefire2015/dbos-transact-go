@@ -760,19 +760,8 @@ func (s *systemDatabase) ResetSystemDB(ctx context.Context) error {
 	}
 	defer conn.Close(ctx)
 
-	// Terminate all existing connections to the target database
-	terminateQuery := `
-		SELECT pg_terminate_backend(pid)
-		FROM pg_stat_activity
-		WHERE datname = $1 AND pid <> pg_backend_pid()`
-
-	_, err = conn.Exec(ctx, terminateQuery, dbName)
-	if err != nil {
-		return fmt.Errorf("failed to terminate connections to database %s: %w", dbName, err)
-	}
-
 	// Drop the database
-	dropSQL := fmt.Sprintf("DROP DATABASE IF EXISTS %s", pgx.Identifier{dbName}.Sanitize())
+	dropSQL := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", pgx.Identifier{dbName}.Sanitize())
 	_, err = conn.Exec(ctx, dropSQL)
 	if err != nil {
 		return fmt.Errorf("failed to drop database %s: %w", dbName, err)
