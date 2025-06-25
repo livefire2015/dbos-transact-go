@@ -3,6 +3,7 @@ package dbos
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 func recoverPendingWorkflows(ctx context.Context, executorIDs []string) ([]WorkflowHandle[any], error) {
@@ -18,6 +19,13 @@ func recoverPendingWorkflows(ctx context.Context, executorIDs []string) ([]Workf
 	}
 
 	for _, workflow := range pendingWorkflows {
+		if inputStr, ok := workflow.Input.(string); ok {
+			if strings.Contains(inputStr, "Failed to decode") {
+				fmt.Println("Skipping workflow recovery due to input decoding failure:", workflow.ID, "Name:", workflow.Name)
+				continue
+			}
+		}
+
 		fmt.Println("Recovering workflow:", workflow.ID, "Name:", workflow.Name, "Input:", workflow.Input)
 		// TODO: handle clearing queue assignment if needed, and append a polling handle
 		if workflow.QueueName != nil {
