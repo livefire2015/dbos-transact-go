@@ -1,11 +1,8 @@
 package dbos
 
 import (
-	"bytes"
 	"context"
 	"embed"
-	"encoding/base64"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"os"
@@ -55,19 +52,19 @@ func createDatabaseIfNotExists(databaseURL string) error {
 	// Connect to the postgres database
 	parsedURL, err := pgx.ParseConfig(databaseURL)
 	if err != nil {
-		return fmt.Errorf("failed to parse database URL: %w", err)
+		return NewInitializationError(fmt.Sprintf("failed to parse database URL: %v", err))
 	}
 
 	dbName := parsedURL.Database
 	if dbName == "" {
-		return fmt.Errorf("database name not found in URL")
+		return NewInitializationError("database name not found in URL")
 	}
 
 	serverURL := parsedURL.Copy()
 	serverURL.Database = "postgres"
 	conn, err := pgx.ConnectConfig(context.Background(), serverURL)
 	if err != nil {
-		return fmt.Errorf("failed to connect to PostgreSQL server: %w", err)
+		return NewInitializationError(fmt.Sprintf("failed to connect to PostgreSQL server: %v", err))
 	}
 	defer conn.Close(context.Background())
 
@@ -76,14 +73,14 @@ func createDatabaseIfNotExists(databaseURL string) error {
 	err = conn.QueryRow(context.Background(),
 		"SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", dbName).Scan(&exists)
 	if err != nil {
-		return fmt.Errorf("failed to check if database exists: %w", err)
+		return NewInitializationError(fmt.Sprintf("failed to check if database exists: %v", err))
 	}
 	if !exists {
 		// TODO: validate db name
 		createSQL := fmt.Sprintf("CREATE DATABASE %s", pgx.Identifier{dbName}.Sanitize())
 		_, err = conn.Exec(context.Background(), createSQL)
 		if err != nil {
-			return fmt.Errorf("failed to create database %s: %w", dbName, err)
+			return NewInitializationError(fmt.Sprintf("failed to create database %s: %v", dbName, err))
 		}
 	}
 
@@ -101,20 +98,20 @@ func runMigrations(databaseURL string) error {
 	// Create migration source from embedded files
 	d, err := iofs.New(migrationFiles, "migrations")
 	if err != nil {
-		return fmt.Errorf("failed to create migration source: %w", err)
+		return NewInitializationError(fmt.Sprintf("failed to create migration source: %v", err))
 	}
 
 	// Create migrator
 	m, err := migrate.NewWithSourceInstance("iofs", d, databaseURL)
 	if err != nil {
-		return fmt.Errorf("failed to create migrator: %w", err)
+		return NewInitializationError(fmt.Sprintf("failed to create migrator: %v", err))
 	}
 	defer m.Close()
 
 	// Run migrations
 	// FIXME: tolerate errors when the migration is bcz we run an older version of transact
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		return fmt.Errorf("failed to run migrations: %w", err)
+		return NewInitializationError(fmt.Sprintf("failed to run migrations: %v", err))
 	}
 
 	return nil
@@ -125,30 +122,30 @@ func NewSystemDatabase() (SystemDatabase, error) {
 	// TODO: pass proper config
 	databaseURL := os.Getenv("DBOS_DATABASE_URL")
 	if databaseURL == "" {
-		return nil, fmt.Errorf("DBOS_DATABASE_URL environment variable is required")
+		return nil, NewInitializationError("DBOS_DATABASE_URL environment variable is required")
 	}
 
 	// Create the database if it doesn't exist
 	if err := createDatabaseIfNotExists(databaseURL); err != nil {
-		return nil, fmt.Errorf("failed to create database: %w", err)
+		return nil, NewInitializationError(fmt.Sprintf("failed to create database: %v", err))
 	}
 
 	// Run migrations first
 	if err := runMigrations(databaseURL); err != nil {
-		return nil, fmt.Errorf("failed to run migrations: %w", err)
+		return nil, NewInitializationError(fmt.Sprintf("failed to run migrations: %v", err))
 	}
 
 	// Create pgx pool
 	pool, err := pgxpool.New(context.Background(), databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create connection pool: %w", err)
+		return nil, NewInitializationError(fmt.Sprintf("failed to create connection pool: %v", err))
 	}
 
 	// Test the connection
 	// FIXME: remove this
 	if err := pool.Ping(context.Background()); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("failed to ping database: %w", err)
+		return nil, NewInitializationError(fmt.Sprintf("failed to ping database: %v", err))
 	}
 
 	return &systemDatabase{
@@ -205,17 +202,10 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
 		timeoutMs = input.Status.Timeout.Milliseconds()
 	}
 
-	// Serialize input using gob encoding
-	var inputBytes []byte
-	if input.Status.Input != nil {
-		var buf bytes.Buffer
-		enc := gob.NewEncoder(&buf)
-		if err := enc.Encode(&input.Status.Input); err != nil {
-			return nil, fmt.Errorf("failed to encode input: %w", err)
-		}
-		inputBytes = buf.Bytes()
+	inputString, err := serialize(input.Status.Input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize input: %w", err)
 	}
-	inputString := base64.StdEncoding.EncodeToString(inputBytes)
 
 	query := `INSERT INTO dbos.workflow_status (
         workflow_uuid,
@@ -277,6 +267,15 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert workflow status: %w", err)
 	}
+
+	if len(input.Status.Name) > 0 && result.Name != input.Status.Name {
+		return nil, NewConflictingWorkflowError(input.Status.ID, fmt.Sprintf("Workflow already exists with a different name: %s, but the provided name is: %s", result.Name, input.Status.Name))
+	}
+	if len(input.Status.QueueName) > 0 && result.QueueName != nil && input.Status.QueueName != *result.QueueName {
+		fmt.Printf("WARNING: Queue name conflict for workflow %s: %s vs %s\n", input.Status.ID, *result.QueueName, input.Status.QueueName)
+	}
+
+	// TODO implement max retries
 
 	return &result, nil
 }
@@ -374,7 +373,9 @@ func (s *systemDatabase) RecordChildWorkflow(ctx context.Context, input RecordCh
 	if err != nil {
 		// Check for unique constraint violation (conflict ID error)
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
-			return fmt.Errorf("workflow conflict ID error for parent workflow %s and child workflow %s (operation ID: %d)", input.ParentWorkflowID, input.ChildWorkflowID, input.FunctionID)
+			return fmt.Errorf(
+				"child workflow %s already registered for parent workflow %s (operation ID: %d)",
+				input.ChildWorkflowID, input.ParentWorkflowID, input.FunctionID)
 		}
 		return fmt.Errorf("failed to record child workflow: %w", err)
 	}
@@ -552,36 +553,15 @@ func (s *systemDatabase) ListWorkflows(ctx context.Context, input ListWorkflowsD
 			wf.Error = errors.New(*errorStr)
 		}
 
-		if outputString != nil && len(*outputString) > 0 {
-			outputBytes, err := base64.StdEncoding.DecodeString(*outputString)
-			if err != nil {
-				return nil, err
-			}
-			buf := bytes.NewBuffer(outputBytes)
-			dec := gob.NewDecoder(buf)
-			var output any
-			if err := dec.Decode(&output); err != nil {
-				// If deserialization fails, record the error
-				wf.Output = fmt.Sprintf("Failed to decode output: %v", err)
-			} else {
-				wf.Output = output
-			}
+		// XXX maybe set wf.Output to outputString and run deserialize out of system DB
+		wf.Output, err = deserialize(outputString)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize output: %w", err)
 		}
 
-		if inputString != nil && len(*inputString) > 0 {
-			inputBytes, err := base64.StdEncoding.DecodeString(*inputString)
-			if err != nil {
-				return nil, err
-			}
-			buf := bytes.NewBuffer(inputBytes)
-			dec := gob.NewDecoder(buf)
-			var input any
-			if err := dec.Decode(&input); err != nil {
-				// If deserialization fails, record the error
-				wf.Input = fmt.Sprintf("Failed to decode input: %v", err)
-			} else {
-				wf.Input = input
-			}
+		wf.Input, err = deserialize(inputString)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize input: %w", err)
 		}
 
 		workflows = append(workflows, wf)
@@ -608,24 +588,16 @@ func (s *systemDatabase) UpdateWorkflowOutcome(ctx context.Context, input Update
 			  SET status = $1, output = $2, error = $3, updated_at = $4, deduplication_id = NULL
 			  WHERE workflow_uuid = $5`
 
-	// Serialize output using gob encoding
-	var outputBytes []byte
-	if input.output != nil {
-		var buf bytes.Buffer
-		enc := gob.NewEncoder(&buf)
-		if err := enc.Encode(&input.output); err != nil {
-			return fmt.Errorf("failed to encode output: %w", err)
-		}
-		outputBytes = buf.Bytes()
+	outputString, err := serialize(input.output)
+	if err != nil {
+		return fmt.Errorf("failed to serialize output: %w", err)
 	}
-	outputString := base64.StdEncoding.EncodeToString(outputBytes)
 
 	var errorStr string
 	if input.err != nil {
 		errorStr = input.err.Error()
 	}
 
-	var err error
 	if input.tx != nil {
 		_, err = input.tx.Exec(ctx, query, input.status, outputString, errorStr, time.Now().UnixMilli(), input.workflowID)
 	} else {
@@ -655,7 +627,7 @@ func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) 
 		return err
 	}
 	if len(wfs) == 0 {
-		return fmt.Errorf("workflow %s not found", workflowID)
+		return NewNonExistentWorkflowError(workflowID)
 	}
 
 	wf := wfs[0]
@@ -704,24 +676,15 @@ func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID str
 		switch status {
 		case WorkflowStatusSuccess:
 			// Deserialize output from TEXT to bytes then from bytes to R using gob
-			if outputString != nil && len(*outputString) > 0 {
-				outputBytes, err := base64.StdEncoding.DecodeString(*outputString)
-				if err != nil {
-					return nil, err
-				}
-				buf := bytes.NewBuffer(outputBytes)
-				dec := gob.NewDecoder(buf)
-				var output any
-				if err := dec.Decode(&output); err != nil {
-					return nil, fmt.Errorf("failed to decode workflow output: %w", err)
-				}
-				return output, nil
+			output, err := deserialize(outputString)
+			if err != nil {
+				return nil, fmt.Errorf("failed to deserialize output: %w", err)
 			}
-			return nil, nil // No output
+			return output, nil
 		case WorkflowStatusError:
 			return nil, errors.New(*errorStr) // Assuming errorStr can be converted to an error type
 		case WorkflowStatusCancelled:
-			return nil, fmt.Errorf("workflow %s was cancelled", workflowID)
+			return nil, NewAwaitedWorkflowCancelledError(workflowID)
 		default:
 			time.Sleep(1 * time.Second) // Wait before checking again
 		}
@@ -765,14 +728,14 @@ func (s *systemDatabase) CheckOperationExecution(ctx context.Context, input Chec
 	err = tx.QueryRow(ctx, workflowStatusQuery, input.workflowID).Scan(&workflowStatus)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return nil, fmt.Errorf("error: Workflow %s does not exist", input.workflowID)
+			return nil, NewNonExistentWorkflowError(input.workflowID)
 		}
 		return nil, fmt.Errorf("failed to get workflow status: %w", err)
 	}
 
 	// If the workflow is cancelled, raise the exception
 	if workflowStatus == WorkflowStatusCancelled {
-		return nil, fmt.Errorf("workflow %s is cancelled. Aborting function", input.workflowID)
+		return nil, NewWorkflowCancelledError(input.workflowID)
 	}
 
 	// Execute second query to get operation outputs
@@ -792,22 +755,12 @@ func (s *systemDatabase) CheckOperationExecution(ctx context.Context, input Chec
 
 	// If the provided and recorded function name are different, throw an exception
 	if input.functionName != recordedFunctionName {
-		return nil, fmt.Errorf("unexpected step error: workflow_id=%s, step_id=%d, expected_name=%s, recorded_name=%s",
-			input.workflowID, input.operationID, input.functionName, recordedFunctionName)
+		return nil, NewUnexpectedStepError(input.workflowID, input.operationID, input.functionName, recordedFunctionName)
 	}
 
-	// Deserialize output if present
-	var output any
-	if outputString != nil && len(*outputString) > 0 {
-		outputBytes, err := base64.StdEncoding.DecodeString(*outputString)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode output: %w", err)
-		}
-		buf := bytes.NewBuffer(outputBytes)
-		dec := gob.NewDecoder(buf)
-		if err := dec.Decode(&output); err != nil {
-			return nil, fmt.Errorf("failed to decode output: %w", err)
-		}
+	output, err := deserialize(outputString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize output: %w", err)
 	}
 
 	var recordedError error
