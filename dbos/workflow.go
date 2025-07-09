@@ -42,7 +42,7 @@ type WorkflowStatus struct {
 	ApplicationVersion string             `json:"application_version"`
 	ApplicationID      *string            `json:"application_id"`
 	Attempts           int                `json:"attempts"`
-	QueueName          *string            `json:"queue_name"`
+	QueueName          string             `json:"queue_name"`
 	Timeout            time.Duration      `json:"timeout"`
 	Deadline           time.Time          `json:"deadline"`
 	StartedAt          time.Time          `json:"started_at"`
@@ -68,6 +68,7 @@ func (ws *WorkflowState) NextStepID() int {
 /********************************/
 type WorkflowHandle[R any] interface {
 	GetResult() (R, error)
+	GetStatus() (WorkflowStatusType, error)
 	GetWorkflowID() string // XXX we could have a base struct with GetWorkflowID and then embed it in the implementations
 }
 
@@ -88,6 +89,27 @@ func (h *workflowHandle[R]) GetResult() (R, error) {
 		var zero R
 		return zero, err
 	}
+}
+
+// GetStatus returns the current status of the workflow from the database
+// TODO optimize by caching the status in the handle on GetResult()
+func (h *workflowHandle[R]) GetStatus() (WorkflowStatusType, error) {
+	ctx := context.Background()
+	workflowStatuses, err := getExecutor().systemDB.ListWorkflows(ctx, ListWorkflowsDBInput{
+		WorkflowIDs: []string{h.workflowID},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get workflow status: %w", err)
+	}
+	if len(workflowStatuses) == 0 {
+		return "", fmt.Errorf("workflow with ID '%s' not found", h.workflowID)
+	}
+	status := workflowStatuses[0]
+	if err != nil {
+		return "", fmt.Errorf("failed to get workflow status: %w", err)
+	}
+	return status.Status, nil
+
 }
 
 func (h *workflowHandle[R]) GetWorkflowID() string {
@@ -111,6 +133,26 @@ func (h *workflowPollingHandle[R]) GetResult() (R, error) {
 	return *new(R), err
 }
 
+// GetStatus returns the current status of the workflow from the database
+func (h *workflowPollingHandle[R]) GetStatus() (WorkflowStatusType, error) {
+	ctx := context.Background()
+	workflowStatuses, err := getExecutor().systemDB.ListWorkflows(ctx, ListWorkflowsDBInput{
+		WorkflowIDs: []string{h.workflowID},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to get workflow status: %w", err)
+	}
+	if len(workflowStatuses) == 0 {
+		return "", fmt.Errorf("workflow with ID '%s' not found", h.workflowID)
+	}
+	status := workflowStatuses[0]
+	if err != nil {
+		return "", fmt.Errorf("failed to get workflow status: %w", err)
+	}
+	return status.Status, nil
+
+}
+
 func (h *workflowPollingHandle[R]) GetWorkflowID() string {
 	return h.workflowID
 }
@@ -118,25 +160,28 @@ func (h *workflowPollingHandle[R]) GetWorkflowID() string {
 /**********************************/
 /******* WORKFLOW REGISTRY *******/
 /**********************************/
-type TypedErasedWorkflowWrapperFunc func(ctx context.Context, params WorkflowParams, input any) (WorkflowHandle[any], error)
+type TypedErasedWorkflowWrapperFunc func(ctx context.Context, input any, opts ...WorkflowOption) (WorkflowHandle[any], error)
 
 var registry = make(map[string]TypedErasedWorkflowWrapperFunc)
 var regMutex sync.RWMutex
 
 // Register adds a workflow function to the registry (thread-safe, only once per name)
-func registerWorkflow(fqdn string, fn TypedErasedWorkflowWrapperFunc) {
+func registerWorkflow(fqn string, fn TypedErasedWorkflowWrapperFunc) {
 	regMutex.Lock()
 	defer regMutex.Unlock()
 
-	if _, exists := registry[fqdn]; exists {
+	if _, exists := registry[fqn]; exists {
 		// TODO: consider printing a warning instead of panicking
-		panic(fmt.Sprintf("workflow function '%s' is already registered", fqdn))
+		panic(fmt.Sprintf("workflow function '%s' is already registered", fqn))
 	}
 
-	registry[fqdn] = fn
+	registry[fqn] = fn
 }
 
 func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R] {
+	if fn == nil {
+		panic("workflow function cannot be nil")
+	}
 	// Registry the input/output types for gob encoding
 	var p P
 	var r R
@@ -144,24 +189,25 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R]
 	gob.Register(r)
 
 	// Wrap the function in a durable workflow
-	wrappedFunction := WorkflowWrapperFunc[P, R](func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error) {
-		return runAsWorkflow(ctx, params, fn, input)
+	wrappedFunction := WorkflowWrapperFunc[P, R](func(ctx context.Context, input P, opts ...WorkflowOption) (WorkflowHandle[R], error) {
+		return runAsWorkflow(ctx, fn, input, opts...)
 	})
 
 	// Register a type-erased version of the durable workflow for recovery
-	fqdn := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
-	typeErasedWrapper := func(ctx context.Context, params WorkflowParams, input any) (WorkflowHandle[any], error) {
+	fqn := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+	typeErasedWrapper := func(ctx context.Context, input any, opts ...WorkflowOption) (WorkflowHandle[any], error) {
 		typedInput, ok := input.(P)
 		if !ok {
-			return nil, fmt.Errorf("invalid input type for workflow %s", fqdn)
+			return nil, fmt.Errorf("invalid input type for workflow %s", fqn)
 		}
-		handle, err := wrappedFunction(ctx, params, typedInput)
+
+		handle, err := wrappedFunction(ctx, typedInput, opts...)
 		if err != nil {
 			return nil, err
 		}
 		return &workflowPollingHandle[any]{workflowID: handle.GetWorkflowID()}, nil
 	}
-	registerWorkflow(fqdn, typeErasedWrapper)
+	registerWorkflow(fqn, typeErasedWrapper)
 
 	return wrappedFunction
 }
@@ -169,22 +215,64 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R]
 /**********************************/
 /******* WORKFLOW FUNCTIONS *******/
 /**********************************/
+
+type contextKey string
+
+const workflowStateKey contextKey = "workflowState"
+
 type WorkflowFunc[P any, R any] func(ctx context.Context, input P) (R, error)
-type WorkflowWrapperFunc[P any, R any] func(ctx context.Context, params WorkflowParams, input P) (WorkflowHandle[R], error)
+type WorkflowWrapperFunc[P any, R any] func(ctx context.Context, input P, opts ...WorkflowOption) (WorkflowHandle[R], error)
 
 type WorkflowParams struct {
 	WorkflowID string
 	Timeout    time.Duration
 	Deadline   time.Time
+	QueueName  string
 }
 
-func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn WorkflowFunc[P, R], input P) (WorkflowHandle[R], error) {
-	fmt.Println("Running workflow function:", runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(), "with params:", params)
+// WorkflowOption is a functional option for configuring workflow parameters
+type WorkflowOption func(*WorkflowParams)
+
+// WithWorkflowID sets the workflow ID
+func WithWorkflowID(id string) WorkflowOption {
+	return func(p *WorkflowParams) {
+		p.WorkflowID = id
+	}
+}
+
+// WithTimeout sets the workflow timeout
+func WithTimeout(timeout time.Duration) WorkflowOption {
+	return func(p *WorkflowParams) {
+		p.Timeout = timeout
+	}
+}
+
+// WithDeadline sets the workflow deadline
+func WithDeadline(deadline time.Time) WorkflowOption {
+	return func(p *WorkflowParams) {
+		p.Deadline = deadline
+	}
+}
+
+// WithQueue sets the queue name for the workflow
+func WithQueue(queueName string) WorkflowOption {
+	return func(p *WorkflowParams) {
+		p.QueueName = queueName
+	}
+}
+
+func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], input P, opts ...WorkflowOption) (WorkflowHandle[R], error) {
+	// Apply options to build params
+	params := WorkflowParams{}
+	for _, opt := range opts {
+		opt(&params)
+	}
+
 	// First, create a context for the workflow
 	dbosWorkflowContext := context.Background()
 
 	// Check if we are within a workflow (and thus a child workflow)
-	parentWorkflowState, ok := ctx.Value("workflowState").(*WorkflowState)
+	parentWorkflowState, ok := ctx.Value(workflowStateKey).(*WorkflowState)
 	isChildWorkflow := ok && parentWorkflowState != nil
 
 	// TODO Check if cancelled
@@ -202,21 +290,38 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		workflowID = params.WorkflowID
 	}
 
+	// If this is a child workflow that has already been recorded in operations_output, return directly a polling handle
+	if isChildWorkflow {
+		childWorkflowID, err := getExecutor().systemDB.CheckChildWorkflow(dbosWorkflowContext, parentWorkflowState.WorkflowID, parentWorkflowState.stepCounter)
+		if err != nil {
+			return nil, fmt.Errorf("checking child workflow: %w", err)
+		}
+		if childWorkflowID != nil {
+			return &workflowPollingHandle[R]{workflowID: *childWorkflowID}, nil
+		}
+	}
+
+	var status WorkflowStatusType
+	if params.QueueName != "" {
+		status = WorkflowStatusEnqueued
+	} else {
+		status = WorkflowStatusPending
+	}
+
 	workflowStatus := WorkflowStatus{
 		Name:               runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(), // XXX the interface approach would encapsulate this
 		ApplicationVersion: APP_VERSION,
 		ExecutorID:         EXECUTOR_ID,
-		Status:             WorkflowStatusPending,
+		Status:             status,
 		ID:                 workflowID,
 		CreatedAt:          time.Now(),
 		Deadline:           params.Deadline,
 		Timeout:            params.Timeout,
 		Input:              input,
 		ApplicationID:      nil, // TODO: set application ID if available
-		QueueName:          nil, // TODO: set queue name if available
+		QueueName:          params.QueueName,
 	}
-
-	// TODO: before init status, check if we are recovering a child workflow, and return a (DB) handle for it.
+	fmt.Println("Workflow status:", workflowStatus)
 
 	// Init status and record child workflow relationship in a single transaction
 	tx, err := getExecutor().systemDB.(*systemDatabase).pool.Begin(dbosWorkflowContext)
@@ -235,11 +340,12 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 		return nil, fmt.Errorf("inserting workflow status: %w", err)
 	}
 
-	fmt.Println(insertStatusResult)
-
-	switch insertStatusResult.Status {
-	case WorkflowStatusSuccess, WorkflowStatusError:
-		// Workflow already ran, return a DB handle to get the result
+	// Return a polling handle if: we are enqueueing, the workflow is already in a terminal state (success or error),
+	if len(params.QueueName) > 0 || insertStatusResult.Status == WorkflowStatusSuccess || insertStatusResult.Status == WorkflowStatusError {
+		// Commit the transaction to update the number of attempts and/or enact the enqueue
+		if err := tx.Commit(dbosWorkflowContext); err != nil {
+			return nil, fmt.Errorf("failed to commit transaction: %w", err)
+		}
 		return &workflowPollingHandle[R]{workflowID: workflowStatus.ID}, nil
 	}
 
@@ -285,7 +391,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, params WorkflowParams, fn 
 	}
 
 	// Run the function in a goroutine
-	augmentUserContext := context.WithValue(ctx, "workflowState", workflowState)
+	augmentUserContext := context.WithValue(ctx, workflowStateKey, workflowState)
 	go func() {
 		result, err := fn(augmentUserContext, input)
 		if err != nil {
@@ -338,23 +444,56 @@ type StepParams struct {
 	BackoffRate int
 }
 
-func RunAsStep[P any, R any](ctx context.Context, params StepParams, fn StepFunc[P, R], input P) (R, error) {
+// StepOption is a functional option for configuring step parameters
+type StepOption func(*StepParams)
+
+// WithMaxAttempts sets the maximum number of retry attempts for a step
+func WithMaxAttempts(maxAttempts int) StepOption {
+	return func(p *StepParams) {
+		p.MaxAttempts = maxAttempts
+	}
+}
+
+// WithBackoffRate sets the backoff rate for retries
+func WithBackoffRate(backoffRate int) StepOption {
+	return func(p *StepParams) {
+		p.BackoffRate = backoffRate
+	}
+}
+
+func RunAsStep[P any, R any](ctx context.Context, fn StepFunc[P, R], input P, opts ...StepOption) (R, error) {
+	// Apply options to build params
+	params := StepParams{}
+	for _, opt := range opts {
+		opt(&params)
+	}
+
 	// Get workflow state from context
-	workflowState, ok := ctx.Value("workflowState").(*WorkflowState)
+	workflowState, ok := ctx.Value(workflowStateKey).(*WorkflowState)
 	if !ok || workflowState == nil {
 		return *new(R), fmt.Errorf("context does not contain valid workflow state, cannot run step")
 	}
 
-	// Check if cancelled
-	// Check if a result/error is already available
-
 	// Get next step ID
-	stepID := workflowState.NextStepID()
+	operationID := workflowState.NextStepID()
+
+	// Check the step is cancelled, has already completed, or is called with a different name
+	recordedOutput, err := getExecutor().systemDB.CheckOperationExecution(ctx, CheckOperationExecutionDBInput{
+		workflowID:   workflowState.WorkflowID,
+		operationID:  operationID,
+		functionName: runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(),
+	})
+	if err != nil {
+		return *new(R), fmt.Errorf("failed to check operation execution: %w", err)
+	}
+	if recordedOutput != nil {
+		return recordedOutput.output.(R), recordedOutput.err
+	}
 
 	dbInput := recordOperationResultDBInput{
 		workflowID:    workflowState.WorkflowID,
 		operationName: runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(),
-		operationID:   stepID,
+		operationID:   operationID,
 	}
 	stepOutput, stepError := fn(ctx, input)
 	if stepError != nil {

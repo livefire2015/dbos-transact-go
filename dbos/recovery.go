@@ -26,25 +26,37 @@ func recoverPendingWorkflows(ctx context.Context, executorIDs []string) ([]Workf
 			}
 		}
 
-		fmt.Println("Recovering workflow:", workflow.ID, "Name:", workflow.Name, "Input:", workflow.Input)
-		// TODO: handle clearing queue assignment if needed, and append a polling handle
-		if workflow.QueueName != nil {
+		fmt.Println("Recovering workflow:", workflow.ID, "Name:", workflow.Name, "Input:", workflow.Input, "QueueName:", workflow.QueueName)
+		if workflow.QueueName != "" {
+			cleared, err := getExecutor().systemDB.ClearQueueAssignment(ctx, workflow.ID)
+			if err != nil {
+				fmt.Println("Error clearing queue assignment for workflow:", workflow.ID, "Name:", workflow.Name, "Error:", err)
+				continue
+			}
+			if cleared {
+				workflowHandles = append(workflowHandles, &workflowPollingHandle[any]{workflowID: workflow.ID})
+			}
 			continue
 		}
+
 		registeredWorkflow, exists := registry[workflow.Name]
 		if !exists {
 			fmt.Println("Error: workflow function not found in registry:", workflow.Name)
 			continue
 		}
 
-		// Rebuild the parameters
-		params := WorkflowParams{
-			WorkflowID: workflow.ID,
-			Timeout:    workflow.Timeout,
-			Deadline:   workflow.Deadline,
+		// Convert workflow parameters to options
+		opts := []WorkflowOption{
+			WithWorkflowID(workflow.ID),
+		}
+		if workflow.Timeout != 0 {
+			opts = append(opts, WithTimeout(workflow.Timeout))
+		}
+		if !workflow.Deadline.IsZero() {
+			opts = append(opts, WithDeadline(workflow.Deadline))
 		}
 
-		handle, err := registeredWorkflow(ctx, params, workflow.Input)
+		handle, err := registeredWorkflow(ctx, workflow.Input, opts...)
 		if err != nil {
 			fmt.Println("Error recovering workflow:", err)
 		}

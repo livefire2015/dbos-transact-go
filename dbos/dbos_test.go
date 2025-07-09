@@ -3,8 +3,10 @@ package dbos
 /**
 This suite tests high level DBOS features:
 	[x] Wrapping various golang methods in DBODS workflows
-	[] Workflow handles
-	[] wf idempotency
+	[x] Workflow handles
+	[x] wf idempotency
+	[x] encoding / decoding of input/outputs
+	[] Attempt counters
 	[] wf timeout
 	[] wf deadlines
 */
@@ -74,7 +76,7 @@ func simpleWorkflowError(ctx context.Context, input string) (int, error) {
 }
 
 func simpleWorkflowWithStep(ctx context.Context, input string) (string, error) {
-	return RunAsStep[string](ctx, StepParams{}, simpleStep, input)
+	return RunAsStep(ctx, simpleStep, input)
 }
 
 func simpleStep(ctx context.Context, input string) (string, error) {
@@ -86,11 +88,11 @@ func simpleStepError(ctx context.Context, input string) (string, error) {
 }
 
 func simpleWorkflowWithStepError(ctx context.Context, input string) (string, error) {
-	return RunAsStep[string](ctx, StepParams{}, simpleStepError, input)
+	return RunAsStep(ctx, simpleStepError, input)
 }
 
 func simpleWorkflowWithChildWorkflow(ctx context.Context, input string) (string, error) {
-	childHandle, err := simpleWfWithStep(ctx, WorkflowParams{}, input)
+	childHandle, err := simpleWfWithStep(ctx, input)
 	if err != nil {
 		return "", err
 	}
@@ -98,8 +100,13 @@ func simpleWorkflowWithChildWorkflow(ctx context.Context, input string) (string,
 }
 
 // idempotencyWorkflow increments a global counter and returns the input
+func incrementCounter(_ context.Context, value int64) (int64, error) {
+	idempotencyCounter += value
+	return idempotencyCounter, nil
+}
+
 func idempotencyWorkflow(ctx context.Context, input string) (string, error) {
-	idempotencyCounter += 1
+	incrementCounter(ctx, 1)
 	return input, nil
 }
 
@@ -113,15 +120,15 @@ func blockingStep(ctx context.Context, input string) (string, error) {
 var idempotencyWorkflowWithStepEvent *Event
 
 func idempotencyWorkflowWithStep(ctx context.Context, input string) (int64, error) {
-	RunAsStep(ctx, StepParams{}, idempotencyWorkflow, input)
+	RunAsStep(ctx, incrementCounter, 1)
 	idempotencyWorkflowWithStepEvent.Set()
-	RunAsStep(ctx, StepParams{}, blockingStep, input)
+	RunAsStep(ctx, blockingStep, input)
 	return idempotencyCounter, nil
 }
 
 // complexStructWorkflow processes a StepInputStruct using a step and returns the step result
 func structWorkflowWithStep(ctx context.Context, input StepInputStruct) (StepOutputStruct, error) {
-	return RunAsStep[StepInputStruct, StepOutputStruct](ctx, StepParams{}, simpleStructStep, input)
+	return RunAsStep(ctx, simpleStructStep, input)
 }
 
 func simpleStructStep(ctx context.Context, input StepInputStruct) (StepOutputStruct, error) {
@@ -172,7 +179,7 @@ func TestWorkflowsWrapping(t *testing.T) {
 
 	type testCase struct {
 		name           string
-		workflowFunc   func(context.Context, WorkflowParams, string) (any, error)
+		workflowFunc   func(context.Context, string, ...WorkflowOption) (any, error)
 		input          string
 		expectedResult any
 		expectError    bool
@@ -182,8 +189,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 	tests := []testCase{
 		{
 			name: "SimpleWorkflow",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := simpleWf(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := simpleWf(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -195,8 +202,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "SimpleWorkflowError",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := simpleWfError(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := simpleWfError(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -208,8 +215,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "SimpleWorkflowWithStep",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := simpleWfWithStep(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := simpleWfWithStep(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -221,8 +228,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "SimpleWorkflowStruct",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := simpleWfStruct(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := simpleWfStruct(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -234,8 +241,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "ValueReceiverWorkflow",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := simpleWfValue(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := simpleWfValue(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -247,8 +254,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "interfaceMethodWorkflow",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := simpleWfIface(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := simpleWfIface(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -260,9 +267,9 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "GenericWorkflow",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
 				// For generic workflow, we need to convert string to int for testing
-				handle, err := wfInt(ctx, params, "42") // FIXME for now this returns a string because sys db accepts this
+				handle, err := wfInt(ctx, "42", opts...) // FIXME for now this returns a string because sys db accepts this
 				if err != nil {
 					return nil, err
 				}
@@ -274,8 +281,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "ClosureWithCapturedState",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := wfClose(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := wfClose(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -287,12 +294,12 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "AnonymousClosure",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
 				// Create anonymous closure workflow directly in test
 				anonymousWf := WithWorkflow(func(ctx context.Context, in string) (string, error) {
 					return "anonymous-" + in, nil
 				})
-				handle, err := anonymousWf(ctx, params, input)
+				handle, err := anonymousWf(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -304,8 +311,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "SimpleWorkflowWithChildWorkflow",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := simpleWfWithChildWorkflow(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := simpleWfWithChildWorkflow(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -317,8 +324,8 @@ func TestWorkflowsWrapping(t *testing.T) {
 		},
 		{
 			name: "SimpleWorkflowWithStepError",
-			workflowFunc: func(ctx context.Context, params WorkflowParams, input string) (any, error) {
-				handle, err := simpleWfWithStepError(ctx, params, input)
+			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
+				handle, err := simpleWfWithStepError(ctx, input, opts...)
 				if err != nil {
 					return nil, err
 				}
@@ -332,7 +339,7 @@ func TestWorkflowsWrapping(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := tc.workflowFunc(context.Background(), WorkflowParams{WorkflowID: uuid.NewString()}, tc.input)
+			result, err := tc.workflowFunc(context.Background(), tc.input, WithWorkflowID(uuid.NewString()))
 
 			if tc.expectError {
 				if err == nil {
@@ -361,7 +368,7 @@ func TestChildWorkflow(t *testing.T) {
 
 		// Create a parent workflow that calls a child workflow
 		parentWf := WithWorkflow(func(ctx context.Context, input string) (string, error) {
-			childHandle, err := simpleWfWithChildWorkflow(ctx, WorkflowParams{}, input)
+			childHandle, err := simpleWfWithChildWorkflow(ctx, input)
 			if err != nil {
 				return "", err
 			}
@@ -377,7 +384,7 @@ func TestChildWorkflow(t *testing.T) {
 		})
 
 		// Execute the parent workflow
-		parentHandle, err := parentWf(context.Background(), WorkflowParams{WorkflowID: parentWorkflowID}, "test-input")
+		parentHandle, err := parentWf(context.Background(), "test-input", WithWorkflowID(parentWorkflowID))
 		if err != nil {
 			t.Fatalf("failed to execute parent workflow: %v", err)
 		}
@@ -407,7 +414,7 @@ func TestWorkflowIdempotency(t *testing.T) {
 
 		// Execute the same workflow twice with the same ID
 		// First execution
-		handle1, err := idempotencyWf(context.Background(), WorkflowParams{WorkflowID: workflowID}, input)
+		handle1, err := idempotencyWf(context.Background(), input, WithWorkflowID(workflowID))
 		if err != nil {
 			t.Fatalf("failed to execute workflow first time: %v", err)
 		}
@@ -417,7 +424,7 @@ func TestWorkflowIdempotency(t *testing.T) {
 		}
 
 		// Second execution with the same workflow ID
-		handle2, err := idempotencyWf(context.Background(), WorkflowParams{WorkflowID: workflowID}, input)
+		handle2, err := idempotencyWf(context.Background(), input, WithWorkflowID(workflowID))
 		if err != nil {
 			t.Fatalf("failed to execute workflow second time: %v", err)
 		}
@@ -443,7 +450,7 @@ func TestWorkflowEncoding(t *testing.T) {
 
 	t.Run("BuiltInType", func(t *testing.T) {
 		// Test a workflow that uses a built-in type (string)
-		handle, err := simpleWf(context.Background(), WorkflowParams{}, "test")
+		handle, err := simpleWf(context.Background(), "test")
 		if err != nil {
 			t.Fatalf("failed to execute workflow: %v", err)
 		}
@@ -475,7 +482,7 @@ func TestWorkflowEncoding(t *testing.T) {
 			ID:   "step-test",
 		}
 
-		stepHandle, err := structWfWithStep(context.Background(), WorkflowParams{}, stepInput)
+		stepHandle, err := structWfWithStep(context.Background(), stepInput)
 		if err != nil {
 			t.Fatalf("failed to execute step workflow: %v", err)
 		}
@@ -566,7 +573,7 @@ func TestWorkflowRecovery(t *testing.T) {
 		input := "recovery-test"
 		idempotencyWorkflowWithStepEvent = NewEvent()
 		blockingStepStopEvent = NewEvent()
-		handle1, err := idempotencyWfWithStep(context.Background(), WorkflowParams{}, input)
+		handle1, err := idempotencyWfWithStep(context.Background(), input)
 		if err != nil {
 			t.Fatalf("failed to execute workflow first time: %v", err)
 		}
@@ -586,9 +593,16 @@ func TestWorkflowRecovery(t *testing.T) {
 
 		// Check that the workflow ID from the handle is the same as the first handle
 		recoveredHandle := recoveredHandles[0]
+		_, ok := recoveredHandle.(*workflowPollingHandle[any])
+		if !ok {
+			t.Fatalf("expected handle to be of type workflowPollingHandle, got %T", recoveredHandle)
+		}
 		if recoveredHandle.GetWorkflowID() != handle1.GetWorkflowID() {
 			t.Fatalf("expected recovered workflow ID %s, got %s", handle1.GetWorkflowID(), recoveredHandle.GetWorkflowID())
 		}
+
+		idempotencyWorkflowWithStepEvent.Clear()
+		idempotencyWorkflowWithStepEvent.Wait()
 
 		// Check that the first step was *not* re-executed (idempotency counter is still 1)
 		if idempotencyCounter != 1 {
@@ -630,10 +644,3 @@ func TestWorkflowRecovery(t *testing.T) {
 	// Test recovery of specific version only
 	// Test recovery reach max recovery attempts
 }
-
-/*
-Add tests for:
-- Workflow attempt counter
-
-
-*/

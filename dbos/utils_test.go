@@ -5,10 +5,12 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
 
+/* Test database setup */
 func setupDBOS(t *testing.T) {
 	t.Helper()
 
@@ -36,7 +38,7 @@ func setupDBOS(t *testing.T) {
 	}
 	defer conn.Close(context.Background())
 
-	_, err = conn.Exec(context.Background(), "DROP DATABASE IF EXISTS "+dbName)
+	_, err = conn.Exec(context.Background(), "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)")
 	if err != nil {
 		t.Fatalf("failed to drop test database: %v", err)
 	}
@@ -56,6 +58,7 @@ func setupDBOS(t *testing.T) {
 	})
 }
 
+/* Event struct provides a simple synchronization primitive that can be used to signal between goroutines. */
 type Event struct {
 	mu    sync.Mutex
 	cond  *sync.Cond
@@ -87,4 +90,51 @@ func (e *Event) Clear() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.IsSet = false
+}
+
+/* Helpers */
+func equal(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func queueEntriesAreCleanedUp() bool {
+	maxTries := 10
+	success := false
+	for i := 0; i < maxTries; i++ {
+		// Begin transaction
+		tx, err := getExecutor().systemDB.(*systemDatabase).pool.Begin(context.Background())
+		if err != nil {
+			return false
+		}
+
+		query := `SELECT COUNT(*)
+				  FROM dbos.workflow_status
+				  WHERE queue_name IS NOT NULL
+				    AND status IN ('ENQUEUED', 'PENDING')`
+
+		var count int
+		err = tx.QueryRow(context.Background(), query).Scan(&count)
+		tx.Rollback(context.Background()) // Clean up transaction
+
+		if err != nil {
+			return false
+		}
+
+		if count == 0 {
+			success = true
+			break
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+	return success
 }
