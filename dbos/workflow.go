@@ -3,6 +3,7 @@ package dbos
 import (
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
@@ -66,30 +67,55 @@ func (ws *WorkflowState) NextStepID() int {
 /********************************/
 /******* WORKFLOW HANDLES ********/
 /********************************/
+
+// workflowOutcome holds the result and error from workflow execution
+type workflowOutcome[R any] struct {
+	result R
+	err    error
+}
+
 type WorkflowHandle[R any] interface {
-	GetResult() (R, error)
+	GetResult(ctx context.Context) (R, error)
 	GetStatus() (WorkflowStatusType, error)
 	GetWorkflowID() string // XXX we could have a base struct with GetWorkflowID and then embed it in the implementations
 }
 
 // workflowHandle is a concrete implementation of WorkflowHandle
 type workflowHandle[R any] struct {
-	workflowID string
-	resultChan chan R
-	errorChan  chan error
+	workflowID  string
+	outcomeChan chan workflowOutcome[R]
 }
 
 // GetResult waits for the workflow to complete and returns the result
-// TODO record get result in operations_output
-func (h *workflowHandle[R]) GetResult() (R, error) {
-	// TODO check on channels to see if they are closed
-	select {
-	case result := <-h.resultChan:
-		return result, nil
-	case err := <-h.errorChan:
-		var zero R
-		return zero, err
+func (h *workflowHandle[R]) GetResult(ctx context.Context) (R, error) {
+	outcome, ok := <-h.outcomeChan // Blocking read
+	fmt.Println("GetRESULT outcome:", outcome, "ok", ok)
+	if !ok {
+		// Return an error if the channel was closed. In normal operations this would happen if GetResul() is called twice on a handler. The first call should get the buffered result, the second call find zero values (channel is empty and closed).
+		return *new(R), errors.New("workflow result channel is already closed. Did you call GetResult() twice on the same workflow handle?")
 	}
+	// If we are calling GetResult inside a workflow, record the result as a step result
+	parentWorkflowState, ok := ctx.Value(workflowStateKey).(*WorkflowState)
+	isChildWorkflow := ok && parentWorkflowState != nil
+	if isChildWorkflow {
+		encodedOutput, encErr := serialize(outcome.result)
+		if encErr != nil {
+			return *new(R), NewWorkflowExecutionError(parentWorkflowState.WorkflowID, fmt.Sprintf("serializing child workflow result: %v", encErr))
+		}
+		recordGetResultInput := recordChildGetResultDBInput{
+			parentWorkflowID: parentWorkflowState.WorkflowID,
+			childWorkflowID:  h.workflowID,
+			operationID:      parentWorkflowState.NextStepID(),
+			output:           encodedOutput,
+			err:              outcome.err,
+		}
+		recordResultErr := getExecutor().systemDB.RecordChildGetResult(ctx, recordGetResultInput)
+		if recordResultErr != nil {
+			// XXX do we want to fail this?
+			fmt.Println("failed to record get result:", recordResultErr)
+		}
+	}
+	return outcome.result, outcome.err
 }
 
 // GetStatus returns the current status of the workflow from the database
@@ -116,15 +142,34 @@ type workflowPollingHandle[R any] struct {
 	workflowID string
 }
 
-// TODO record get result in operations_output
-func (h *workflowPollingHandle[R]) GetResult() (R, error) {
-	ctx := context.Background()
+func (h *workflowPollingHandle[R]) GetResult(ctx context.Context) (R, error) {
 	result, err := getExecutor().systemDB.AwaitWorkflowResult(ctx, h.workflowID)
 	if result != nil {
 		typedResult, ok := result.(R)
 		if !ok {
 			// TODO check what this looks like in practice
 			return *new(R), NewWorkflowUnexpectedResultType(h.workflowID, fmt.Sprintf("%T", new(R)), fmt.Sprintf("%T", result))
+		}
+		// If we are calling GetResult inside a workflow, record the result as a step result
+		parentWorkflowState, ok := ctx.Value(workflowStateKey).(*WorkflowState)
+		isChildWorkflow := ok && parentWorkflowState != nil
+		if isChildWorkflow {
+			encodedOutput, encErr := serialize(typedResult)
+			if encErr != nil {
+				return *new(R), NewWorkflowExecutionError(parentWorkflowState.WorkflowID, fmt.Sprintf("serializing child workflow result: %v", encErr))
+			}
+			recordGetResultInput := recordChildGetResultDBInput{
+				parentWorkflowID: parentWorkflowState.WorkflowID,
+				childWorkflowID:  h.workflowID,
+				operationID:      parentWorkflowState.NextStepID(),
+				output:           encodedOutput,
+				err:              err,
+			}
+			recordResultErr := getExecutor().systemDB.RecordChildGetResult(ctx, recordGetResultInput)
+			if recordResultErr != nil {
+				// XXX do we want to fail this?
+				fmt.Println("failed to record get result:", recordResultErr)
+			}
 		}
 		return typedResult, err
 	}
@@ -378,17 +423,15 @@ func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], inp
 		return nil, NewWorkflowExecutionError(workflowID, fmt.Sprintf("failed to commit transaction: %v", err))
 	}
 
-	// Channel to receive the result from the goroutine
-	// The buffer size of 1 allows the goroutine to send the result without blocking
+	// Channel to receive the outcome from the goroutine
+	// The buffer size of 1 allows the goroutine to send the outcome without blocking
 	// In addition it allows the channel to be garbage collected
-	resultChan := make(chan R, 1)
-	errorChan := make(chan error, 1)
+	outcomeChan := make(chan workflowOutcome[R], 1)
 
 	// Create the handle
 	handle := &workflowHandle[R]{
-		workflowID: workflowStatus.ID,
-		resultChan: resultChan,
-		errorChan:  errorChan,
+		workflowID:  workflowStatus.ID,
+		outcomeChan: outcomeChan,
 	}
 
 	// Create workflow state to track step execution
@@ -401,25 +444,20 @@ func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], inp
 	augmentUserContext := context.WithValue(ctx, workflowStateKey, workflowState)
 	go func() {
 		result, err := fn(augmentUserContext, input)
+		status := WorkflowStatusSuccess
 		if err != nil {
-			fmt.Println("workflow function returned an error:", err)
-			recordErr := getExecutor().systemDB.UpdateWorkflowOutcome(dbosWorkflowContext, UpdateWorkflowOutcomeDBInput{workflowID: workflowStatus.ID, status: WorkflowStatusError, err: err})
-			if recordErr != nil {
-				// TODO: make sure to return both errors
-				errorChan <- recordErr
-				return
-			}
-			errorChan <- err
-		} else {
-			fmt.Println("workflow function completed successfully, output:", result)
-			recordErr := getExecutor().systemDB.UpdateWorkflowOutcome(dbosWorkflowContext, UpdateWorkflowOutcomeDBInput{workflowID: workflowStatus.ID, status: WorkflowStatusSuccess, output: result})
-			if recordErr != nil {
-				// We cannot return the user code result because we failed to record the output
-				errorChan <- recordErr
-				return
-			}
-			resultChan <- result
+			status = WorkflowStatusError
 		}
+		recordErr := getExecutor().systemDB.UpdateWorkflowOutcome(dbosWorkflowContext, UpdateWorkflowOutcomeDBInput{workflowID: workflowStatus.ID, status: status, err: err, output: result})
+		if recordErr != nil {
+			fmt.Println("Failed to record workflow outcome:", recordErr)
+			// TODO: return both the recording error and the function error
+			outcomeChan <- workflowOutcome[R]{result: *new(R), err: recordErr}
+			close(outcomeChan) // Close the channel to signal completion
+			return
+		}
+		outcomeChan <- workflowOutcome[R]{result: result, err: err}
+		close(outcomeChan) // Close the channel to signal completion
 	}()
 
 	// Run the peer goroutine to handle cancellation and timeout
