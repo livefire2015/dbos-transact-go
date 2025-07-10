@@ -89,7 +89,6 @@ type workflowHandle[R any] struct {
 // GetResult waits for the workflow to complete and returns the result
 func (h *workflowHandle[R]) GetResult(ctx context.Context) (R, error) {
 	outcome, ok := <-h.outcomeChan // Blocking read
-	fmt.Println("GetRESULT outcome:", outcome, "ok", ok)
 	if !ok {
 		// Return an error if the channel was closed. In normal operations this would happen if GetResul() is called twice on a handler. The first call should get the buffered result, the second call find zero values (channel is empty and closed).
 		return *new(R), errors.New("workflow result channel is already closed. Did you call GetResult() twice on the same workflow handle?")
@@ -199,11 +198,16 @@ func (h *workflowPollingHandle[R]) GetWorkflowID() string {
 /**********************************/
 type TypedErasedWorkflowWrapperFunc func(ctx context.Context, input any, opts ...WorkflowOption) (WorkflowHandle[any], error)
 
-var registry = make(map[string]TypedErasedWorkflowWrapperFunc)
+type workflowRegistryEntry struct {
+	wrappedFunction TypedErasedWorkflowWrapperFunc
+	maxRetries      int
+}
+
+var registry = make(map[string]workflowRegistryEntry)
 var regMutex sync.RWMutex
 
 // Register adds a workflow function to the registry (thread-safe, only once per name)
-func registerWorkflow(fqn string, fn TypedErasedWorkflowWrapperFunc) {
+func registerWorkflow(fqn string, fn TypedErasedWorkflowWrapperFunc, maxRetries int) {
 	regMutex.Lock()
 	defer regMutex.Unlock()
 
@@ -212,13 +216,40 @@ func registerWorkflow(fqn string, fn TypedErasedWorkflowWrapperFunc) {
 		panic(NewConflictingRegistrationError(fqn))
 	}
 
-	registry[fqn] = fn
+	registry[fqn] = workflowRegistryEntry{
+		wrappedFunction: fn,
+		maxRetries:      maxRetries,
+	}
 }
 
-func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R] {
+type WorkflowRegistrationParams struct {
+	MaxRetries int
+	// Likely we will allow a name here
+}
+
+type WorkflowRegistrationOption func(*WorkflowRegistrationParams)
+
+const (
+	DEFAULT_MAX_RECOVERY_ATTEMPTS = 100
+)
+
+func WithMaxRetries(maxRetries int) WorkflowRegistrationOption {
+	return func(p *WorkflowRegistrationParams) {
+		p.MaxRetries = maxRetries
+	}
+}
+
+func WithWorkflow[P any, R any](fn WorkflowFunc[P, R], opts ...WorkflowRegistrationOption) WorkflowWrapperFunc[P, R] {
 	if getExecutor() != nil {
 		fmt.Println("warning: WithWorkflow called after DBOS initialization, dynamic registration is not supported")
 		return nil
+	}
+
+	registrationParams := WorkflowRegistrationParams{
+		MaxRetries: DEFAULT_MAX_RECOVERY_ATTEMPTS, // TODO implement "infinite" retries if wanted
+	}
+	for _, opt := range opts {
+		opt(&registrationParams)
 	}
 
 	if fn == nil {
@@ -231,8 +262,9 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R]
 	gob.Register(r)
 
 	// Wrap the function in a durable workflow
-	wrappedFunction := WorkflowWrapperFunc[P, R](func(ctx context.Context, input P, opts ...WorkflowOption) (WorkflowHandle[R], error) {
-		return runAsWorkflow(ctx, fn, input, opts...)
+	wrappedFunction := WorkflowWrapperFunc[P, R](func(ctx context.Context, workflowInput P, opts ...WorkflowOption) (WorkflowHandle[R], error) {
+		opts = append(opts, WithWorkflowMaxRetries(registrationParams.MaxRetries))
+		return runAsWorkflow(ctx, fn, workflowInput, opts...)
 	})
 
 	// Register a type-erased version of the durable workflow for recovery
@@ -249,7 +281,7 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R]) WorkflowWrapperFunc[P, R]
 		}
 		return &workflowPollingHandle[any]{workflowID: handle.GetWorkflowID()}, nil
 	}
-	registerWorkflow(fqn, typeErasedWrapper)
+	registerWorkflow(fqn, typeErasedWrapper, registrationParams.MaxRetries)
 
 	return wrappedFunction
 }
@@ -271,6 +303,7 @@ type WorkflowParams struct {
 	Deadline           time.Time
 	QueueName          string
 	ApplicationVersion string
+	MaxRetries         int
 }
 
 type WorkflowOption func(*WorkflowParams)
@@ -302,6 +335,12 @@ func WithQueue(queueName string) WorkflowOption {
 func WithApplicationVersion(version string) WorkflowOption {
 	return func(p *WorkflowParams) {
 		p.ApplicationVersion = version
+	}
+}
+
+func WithWorkflowMaxRetries(maxRetries int) WorkflowOption {
+	return func(p *WorkflowParams) {
+		p.MaxRetries = maxRetries
 	}
 }
 
@@ -366,7 +405,7 @@ func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], inp
 		Status:             status,
 		ID:                 workflowID,
 		CreatedAt:          time.Now(),
-		Deadline:           params.Deadline,
+		Deadline:           params.Deadline, // TODO compute the deadline based on the timeout
 		Timeout:            params.Timeout,
 		Input:              input,
 		ApplicationID:      APP_ID,
@@ -382,12 +421,13 @@ func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], inp
 
 	// Insert workflow status with transaction
 	insertInput := InsertWorkflowStatusDBInput{
-		Status: workflowStatus,
-		Tx:     tx,
+		status:     workflowStatus,
+		maxRetries: params.MaxRetries,
+		tx:         tx,
 	}
 	insertStatusResult, err := getExecutor().systemDB.InsertWorkflowStatus(dbosWorkflowContext, insertInput)
 	if err != nil {
-		return nil, NewWorkflowExecutionError(workflowID, fmt.Sprintf("inserting workflow status: %v", err))
+		return nil, err
 	}
 
 	// Return a polling handle if: we are enqueueing, the workflow is already in a terminal state (success or error),
