@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -16,8 +17,10 @@ This suite tests
 [x] recover queued workflow
 [x] global concurrency (one at a time with a single queue and a single worker)
 [x] worker concurrency (2 at a time across two "workers")
-[] worker concurrency X recovery
-[] rate limiter
+[x] worker concurrency X recovery
+[x] rate limiter
+[] queue deduplication
+[] queue priority
 [] queued workflow times out
 [] scheduled workflow enqueues another workflow
 */
@@ -27,6 +30,16 @@ var (
 	queueWf             = WithWorkflow(queueWorkflow)
 	queueWfWithChild    = WithWorkflow(queueWorkflowWithChild)
 	queueWfThatEnqueues = WithWorkflow(queueWorkflowThatEnqueues)
+
+	// Variables for successive enqueue test
+	successiveEnqueueQueue         = NewWorkflowQueue("test-successive-enqueue-queue")
+	successiveEnqueueStartEvent    = NewEvent()
+	successiveEnqueueCompleteEvent = NewEvent()
+	successiveEnqueueWorkflow      = WithWorkflow(func(ctx context.Context, input string) (string, error) {
+		successiveEnqueueStartEvent.Set()
+		successiveEnqueueCompleteEvent.Wait()
+		return input, nil
+	})
 )
 
 func queueWorkflow(ctx context.Context, input string) (string, error) {
@@ -148,6 +161,45 @@ func TestWorkflowQueues(t *testing.T) {
 		q := NewWorkflowQueue("dynamic-queue")
 		if len(q.Name) > 0 {
 			t.Fatalf("expected nil queue for dynamic registration after DBOS initialization, got %v", q)
+		}
+	})
+
+	t.Run("SuccessiveEnqueuesDoNotIncreaseAttempts", func(t *testing.T) {
+		workflowID := "blocking-workflow-test"
+
+		// Enqueue the workflow for the first time
+		originalHandle, err := successiveEnqueueWorkflow(context.Background(), "test-input", WithQueue(successiveEnqueueQueue.Name), WithWorkflowID(workflowID))
+		if err != nil {
+			t.Fatalf("failed to enqueue blocking workflow: %v", err)
+		}
+
+		// Wait for the workflow to start
+		successiveEnqueueStartEvent.Wait()
+
+		// Try to enqueue the same workflow 5 more times
+		for i := 0; i < 5; i++ {
+			_, err := successiveEnqueueWorkflow(context.Background(), "test-input", WithQueue(successiveEnqueueQueue.Name), WithWorkflowID(workflowID))
+			if err != nil {
+				t.Fatalf("failed to enqueue workflow attempt %d: %v", i+1, err)
+			}
+		}
+
+		// Get the status from the original handle and check the attempts counter
+		status, err := originalHandle.GetStatus()
+		if err != nil {
+			t.Fatalf("failed to get status of original workflow handle: %v", err)
+		}
+
+		// The attempts counter should still be 1 (the original enqueue)
+		if status.Attempts != 1 {
+			t.Fatalf("expected attempts to be 1, got %d", status.Attempts)
+		}
+
+		// Allow the workflow to complete
+		successiveEnqueueCompleteEvent.Set()
+
+		if !queueEntriesAreCleanedUp() {
+			t.Fatal("expected queue entries to be cleaned up after successive enqueues test")
 		}
 	})
 }
@@ -324,8 +376,8 @@ func TestGlobalConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get status of workflow2: %v", err)
 	}
-	if status != WorkflowStatusEnqueued {
-		t.Fatalf("expected workflow2 to be in ENQUEUED status, got %v", status)
+	if status.Status != WorkflowStatusEnqueued {
+		t.Fatalf("expected workflow2 to be in ENQUEUED status, got %v", status.Status)
 	}
 
 	// Allow the first workflow to complete
@@ -537,8 +589,8 @@ func TestWorkerConcurrencyXRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get status of workflow2: %v", err)
 	}
-	if status2 != WorkflowStatusEnqueued {
-		t.Fatalf("expected workflow2 to be in ENQUEUED status, got %v", status2)
+	if status2.Status != WorkflowStatusEnqueued {
+		t.Fatalf("expected workflow2 to be in ENQUEUED status, got %v", status2.Status)
 	}
 
 	// Verify workflow2 hasn't started yet
@@ -566,8 +618,8 @@ func TestWorkerConcurrencyXRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get status of recovered workflow1: %v", err)
 	}
-	if wf1Status != WorkflowStatusEnqueued {
-		t.Fatalf("expected recovered handle to be in ENQUEUED status, got %v", wf1Status)
+	if wf1Status.Status != WorkflowStatusEnqueued {
+		t.Fatalf("expected recovered handle to be in ENQUEUED status, got %v", wf1Status.Status)
 	}
 
 	// The 1 first workflow should have been dequeued again (FIFO ordering) and the 2nd workflow should still be enqueued
@@ -576,8 +628,8 @@ func TestWorkerConcurrencyXRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get status of workflow2: %v", err)
 	}
-	if status2 != WorkflowStatusEnqueued {
-		t.Fatalf("expected workflow2 to still be in ENQUEUED status, got %v", status2)
+	if status2.Status != WorkflowStatusEnqueued {
+		t.Fatalf("expected workflow2 to still be in ENQUEUED status, got %v", status2.Status)
 	}
 
 	// Let the 1st workflow complete and let the 2nd workflow start and complete
@@ -606,5 +658,106 @@ func TestWorkerConcurrencyXRecovery(t *testing.T) {
 	// Ensure queueEntriesAreCleanedUp is set to true
 	if !queueEntriesAreCleanedUp() {
 		t.Fatal("expected queue entries to be cleaned up after worker concurrency recovery test")
+	}
+}
+
+var (
+	rateLimiterQueue    = NewWorkflowQueue("test-rate-limiter-queue", WithRateLimiter(&RateLimiter{Limit: 5, Period: 1.8}))
+	rateLimiterWorkflow = WithWorkflow(rateLimiterTestWorkflow)
+)
+
+func rateLimiterTestWorkflow(ctx context.Context, _ string) (time.Time, error) {
+	return time.Now(), nil // Return current time
+}
+
+func TestQueueRateLimiter(t *testing.T) {
+	setupDBOS(t)
+
+	limit := 5
+	period := 1.8
+	numWaves := 3
+
+	var handles []WorkflowHandle[time.Time]
+	var times []time.Time
+
+	// Launch a number of tasks equal to three times the limit.
+	// This should lead to three "waves" of the limit tasks being
+	// executed simultaneously, followed by a wait of the period,
+	// followed by the next wave.
+	for i := 0; i < limit*numWaves; i++ {
+		handle, err := rateLimiterWorkflow(context.Background(), "", WithQueue(rateLimiterQueue.Name))
+		if err != nil {
+			t.Fatalf("failed to enqueue workflow %d: %v", i, err)
+		}
+		handles = append(handles, handle)
+	}
+
+	// Get results from all workflows
+	for _, handle := range handles {
+		result, err := handle.GetResult(context.Background())
+		if err != nil {
+			t.Fatalf("failed to get result from workflow: %v", err)
+		}
+		// XXX in reality this should use the actual start time -- not the completion time.
+		times = append(times, result)
+	}
+
+	// We'll now group the workflows into "waves" based on their start times, and verify that each wave has fewer than the limit of workflows.
+
+	// Sort times to ensure we process them in chronological order
+	sortedTimes := make([]time.Time, len(times))
+	copy(sortedTimes, times)
+	// Simple sort implementation for time.Time slice
+	for i := range sortedTimes {
+		for j := i + 1; j < len(sortedTimes); j++ {
+			if sortedTimes[j].Before(sortedTimes[i]) {
+				sortedTimes[i], sortedTimes[j] = sortedTimes[j], sortedTimes[i]
+			}
+		}
+	}
+
+	// Dynamically compute waves based on start times
+	if len(sortedTimes) == 0 {
+		t.Fatal("no workflow times recorded")
+	}
+
+	baseTime := sortedTimes[0]
+	waveMap := make(map[int][]time.Time)
+
+	// Group workflows into waves based on their start time
+	for _, workflowTime := range sortedTimes {
+		timeSinceBase := workflowTime.Sub(baseTime).Seconds()
+		waveIndex := int(timeSinceBase / period)
+		waveMap[waveIndex] = append(waveMap[waveIndex], workflowTime)
+	}
+	// Verify each wave has fewer than the limit
+	for waveIndex, wave := range waveMap {
+		if len(wave) > limit {
+			t.Fatalf("wave %d has %d workflows, which exceeds the limit of %d", waveIndex, len(wave), limit)
+		}
+		if len(wave) == 0 {
+			t.Fatalf("wave %d is empty, which shouldn't happen", waveIndex)
+		}
+	}
+	// Verify we have the expected number of waves (allowing some tolerance)
+	expectedWaves := numWaves
+	if len(waveMap) < expectedWaves-1 || len(waveMap) > expectedWaves+1 {
+		t.Fatalf("expected approximately %d waves, got %d", expectedWaves, len(waveMap))
+	}
+
+	// Verify all workflows get the SUCCESS status eventually
+	for i, handle := range handles {
+		status, err := handle.GetStatus()
+		if err != nil {
+			t.Fatalf("failed to get status for workflow %d: %v", i, err)
+		}
+		if status.Status != WorkflowStatusSuccess {
+			t.Fatalf("expected workflow %d to have SUCCESS status, got %v", i, status.Status)
+		}
+	}
+
+	// Verify all queue entries eventually get cleaned up.
+	if !queueEntriesAreCleanedUp() {
+		t.Fatal("expected queue entries to be cleaned up after rate limiter test")
 	}
 }

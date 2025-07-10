@@ -17,15 +17,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// MaxInt represents the maximum integer value
-const MaxInt = float64(^uint(0) >> 1)
-
 /*******************************/
 /******* INTERFACE ********/
 /*******************************/
 
 type SystemDatabase interface {
-	Destroy()
+	Shutdown()
 	ResetSystemDB(ctx context.Context) error
 	InsertWorkflowStatus(ctx context.Context, input InsertWorkflowStatusDBInput) (*InsertWorkflowResult, error)
 	RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error
@@ -154,7 +151,7 @@ func NewSystemDatabase() (SystemDatabase, error) {
 	}, nil
 }
 
-func (s *systemDatabase) Destroy() {
+func (s *systemDatabase) Shutdown() {
 	fmt.Println("Closing system database connection pool")
 	s.pool.Close()
 }
@@ -230,10 +227,13 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
     ) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
     ON CONFLICT (workflow_uuid)
         DO UPDATE SET
-            recovery_attempts = workflow_status.recovery_attempts + 1,
+			recovery_attempts = CASE
+                WHEN EXCLUDED.status != $19 THEN workflow_status.recovery_attempts + 1
+                ELSE workflow_status.recovery_attempts
+            END,
             updated_at = EXCLUDED.updated_at,
             executor_id = CASE
-                WHEN EXCLUDED.status = 'ENQUEUED' THEN workflow_status.executor_id
+                WHEN EXCLUDED.status = $20 THEN workflow_status.executor_id
                 ELSE EXCLUDED.executor_id
             END
         RETURNING recovery_attempts, status, name, queue_name, workflow_deadline_epoch_ms`
@@ -258,6 +258,8 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input InsertW
 		inputString,
 		input.Status.DeduplicationID,
 		input.Status.Priority,
+		WorkflowStatusEnqueued,
+		WorkflowStatusEnqueued,
 	).Scan(
 		&result.Attempts,
 		&result.Status,
@@ -831,10 +833,38 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 		return nil, fmt.Errorf("failed to set transaction isolation level: %w", err)
 	}
 
+	// First check the rate limiter
 	startTimeMs := time.Now().UnixMilli()
+	var numRecentQueries int
+	if queue.Limiter != nil {
+		limiterPeriod := time.Duration(queue.Limiter.Period * float64(time.Second))
+
+		// Calculate the cutoff time: current time minus limiter period
+		cutoffTimeMs := time.Now().Add(-limiterPeriod).UnixMilli()
+
+		// Count workflows that have started in the limiter period
+		limiterQuery := `
+		SELECT COUNT(*)
+		FROM dbos.workflow_status
+		WHERE queue_name = $1
+		  AND status != $2
+		  AND started_at_epoch_ms > $3`
+
+		err := tx.QueryRow(ctx, limiterQuery,
+			queue.Name,
+			WorkflowStatusEnqueued,
+			cutoffTimeMs).Scan(&numRecentQueries)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query rate limiter: %w", err)
+		}
+
+		if numRecentQueries >= queue.Limiter.Limit {
+			return []dequeuedWorkflow{}, nil
+		}
+	}
 
 	// Calculate max_tasks based on concurrency limits
-	maxTasks := MaxInt
+	maxTasks := queue.MaxTasksPerIteration
 
 	if queue.WorkerConcurrency != nil || queue.GlobalConcurrency != nil {
 		// Count pending workflows by executor
@@ -870,7 +900,7 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 					localPendingWorkflows, queue.Name, workerConcurrency)
 			}
 			availableWorkerTasks := max(workerConcurrency-localPendingWorkflows, 0)
-			maxTasks = float64(availableWorkerTasks)
+			maxTasks = uint(availableWorkerTasks)
 		}
 
 		// Check global concurrency limit
@@ -886,8 +916,8 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 					globalPendingWorkflows, queue.Name, concurrency)
 			}
 			availableTasks := max(concurrency-globalPendingWorkflows, 0)
-			if float64(availableTasks) < maxTasks {
-				maxTasks = float64(availableTasks)
+			if uint(availableTasks) < maxTasks {
+				maxTasks = uint(availableTasks)
 			}
 		}
 	}
@@ -925,7 +955,7 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 	}
 
 	// Add limit if maxTasks is finite
-	if maxTasks != MaxInt {
+	if maxTasks > 0 {
 		query += fmt.Sprintf(" LIMIT %d", int(maxTasks))
 	}
 
@@ -946,14 +976,18 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 	}
 
 	if len(dequeuedIDs) > 0 {
-		fmt.Printf("[%s] dequeueing %d task(s)\n", queue.Name, len(dequeuedIDs))
+		fmt.Printf("[%s] attempting to dequeue %d task(s)\n", queue.Name, len(dequeuedIDs))
 	}
 
 	// Update workflows to PENDING status and get their details
 	var retWorkflows []dequeuedWorkflow
 	for _, id := range dequeuedIDs {
-		// TODO handle rate limite
-
+		// If we have a limiter, stop dequeueing workflows when the number of workflows started this period exceeds the limit.
+		if queue.Limiter != nil {
+			if len(retWorkflows)+numRecentQueries >= queue.Limiter.Limit {
+				break
+			}
+		}
 		retWorkflow := dequeuedWorkflow{
 			id: id,
 		}
