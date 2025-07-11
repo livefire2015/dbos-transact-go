@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/robfig/cron/v3"
 )
 
 /*******************************/
@@ -223,7 +224,8 @@ func registerWorkflow(fqn string, fn TypedErasedWorkflowWrapperFunc, maxRetries 
 }
 
 type WorkflowRegistrationParams struct {
-	MaxRetries int
+	CronSchedule string
+	MaxRetries   int
 	// Likely we will allow a name here
 }
 
@@ -236,6 +238,12 @@ const (
 func WithMaxRetries(maxRetries int) WorkflowRegistrationOption {
 	return func(p *WorkflowRegistrationParams) {
 		p.MaxRetries = maxRetries
+	}
+}
+
+func WithSchedule(schedule string) WorkflowRegistrationOption {
+	return func(p *WorkflowRegistrationParams) {
+		p.CronSchedule = schedule
 	}
 }
 
@@ -255,6 +263,8 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R], opts ...WorkflowRegistrat
 	if fn == nil {
 		panic("workflow function cannot be nil")
 	}
+	fqn := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
+
 	// Registry the input/output types for gob encoding
 	var p P
 	var r R
@@ -267,8 +277,36 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R], opts ...WorkflowRegistrat
 		return runAsWorkflow(ctx, fn, workflowInput, opts...)
 	})
 
+	// If this is a scheduled workflow, register a cron job
+	if registrationParams.CronSchedule != "" {
+		if reflect.TypeOf(p) != reflect.TypeOf(time.Time{}) {
+			panic(fmt.Sprintf("scheduled workflow function must accept ScheduledWorkflowInput as input, got %T", p))
+		}
+		if workflowScheduler == nil {
+			workflowScheduler = cron.New(cron.WithSeconds())
+		}
+		var entryID cron.EntryID
+		entryID, err := workflowScheduler.AddFunc(registrationParams.CronSchedule, func() {
+			// Execute the workflow on the cron schedule once DBOS is launched
+			if getExecutor() == nil {
+				return
+			}
+			// Get the scheduled time from the cron entry
+			entry := workflowScheduler.Entry(entryID)
+			scheduledTime := entry.Prev
+			if scheduledTime.IsZero() {
+				// Use Next if Prev is not set, which will only happen for the first run
+				scheduledTime = entry.Next
+			}
+			wfID := fmt.Sprintf("sched-%s-%s", fqn, scheduledTime) // XXX we can rethink the format
+			wrappedFunction(context.Background(), any(scheduledTime).(P), WithWorkflowID(wfID), WithQueue(DBOS_INTERNAL_QUEUE_NAME))
+		})
+		if err != nil {
+			panic(fmt.Sprintf("failed to register scheduled workflow: %v", err))
+		}
+	}
+
 	// Register a type-erased version of the durable workflow for recovery
-	fqn := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
 	typeErasedWrapper := func(ctx context.Context, input any, opts ...WorkflowOption) (WorkflowHandle[any], error) {
 		typedInput, ok := input.(P)
 		if !ok {
@@ -346,7 +384,9 @@ func WithWorkflowMaxRetries(maxRetries int) WorkflowOption {
 
 func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], input P, opts ...WorkflowOption) (WorkflowHandle[R], error) {
 	// Apply options to build params
-	params := WorkflowParams{}
+	params := WorkflowParams{
+		ApplicationVersion: APP_VERSION,
+	}
 	for _, opt := range opts {
 		opt(&params)
 	}
@@ -391,16 +431,9 @@ func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], inp
 		status = WorkflowStatusPending
 	}
 
-	var appVersion string
-	if len(params.ApplicationVersion) > 0 {
-		appVersion = params.ApplicationVersion
-	} else {
-		appVersion = APP_VERSION
-	}
-
 	workflowStatus := WorkflowStatus{
 		Name:               runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(), // XXX the interface approach would encapsulate this
-		ApplicationVersion: appVersion,
+		ApplicationVersion: params.ApplicationVersion,
 		ExecutorID:         EXECUTOR_ID,
 		Status:             status,
 		ID:                 workflowID,
@@ -586,19 +619,19 @@ func RunAsStep[P any, R any](ctx context.Context, fn StepFunc[P, R], input P, op
 	}
 	stepOutput, stepError := fn(ctx, input)
 	if stepError != nil {
-		fmt.Println("step function returned an error:", stepError)
+		// fmt.Println("step function returned an error:", stepError)
 		dbInput.err = stepError
 		err := getExecutor().systemDB.RecordOperationResult(ctx, dbInput)
 		if err != nil {
-			fmt.Println("failed to record step error:", err)
+			// fmt.Println("failed to record step error:", err)
 			return *new(R), NewStepExecutionError(workflowState.WorkflowID, operationName, fmt.Sprintf("recording step error: %v", err))
 		}
 	} else {
-		fmt.Println("step function completed successfully, output:", stepOutput)
+		// fmt.Println("step function completed successfully, output:", stepOutput)
 		dbInput.output = stepOutput
 		err := getExecutor().systemDB.RecordOperationResult(ctx, dbInput)
 		if err != nil {
-			fmt.Println("failed to record step output:", err)
+			// fmt.Println("failed to record step output:", err)
 			return *new(R), NewStepExecutionError(workflowState.WorkflowID, operationName, fmt.Sprintf("recording step output: %v", err))
 		}
 	}

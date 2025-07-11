@@ -14,7 +14,11 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-var workflowQueueRegistry = make(map[string]WorkflowQueue)
+var (
+	workflowQueueRegistry    = make(map[string]WorkflowQueue)
+	DBOS_INTERNAL_QUEUE_NAME = "_dbos_internal_queue"
+	_                        = NewWorkflowQueue(DBOS_INTERNAL_QUEUE_NAME)
+)
 
 // RateLimiter represents a rate limiting configuration
 type RateLimiter struct {
@@ -108,13 +112,16 @@ func queueRunner(ctx context.Context) {
 
 	pollingInterval := baseInterval
 
+	// XXX doing this lets the dequeue and the task invokation survive the context cancellation
+	// We might be OK with not doing this. During the tests it results in all sorts of error inside the two functions above due to context cancellation
+	runnerContext := context.WithoutCancel(ctx)
 	for {
 		hasBackoffError := false
 
 		// Iterate through all queues in the registry
 		for queueName, queue := range workflowQueueRegistry {
 			// Call DequeueWorkflows for each queue
-			dequeuedWorkflows, err := getExecutor().systemDB.DequeueWorkflows(ctx, queue)
+			dequeuedWorkflows, err := getExecutor().systemDB.DequeueWorkflows(runnerContext, queue)
 			if err != nil {
 				if pgErr, ok := err.(*pgconn.PgError); ok {
 					switch pgErr.Code {
@@ -131,7 +138,7 @@ func queueRunner(ctx context.Context) {
 
 			// Print what was dequeued
 			if len(dequeuedWorkflows) > 0 {
-				fmt.Printf("Dequeued %d workflows from queue '%s': %v\n", len(dequeuedWorkflows), queueName, dequeuedWorkflows)
+				//fmt.Printf("Dequeued %d workflows from queue '%s': %v\n", len(dequeuedWorkflows), queueName, dequeuedWorkflows)
 			}
 			for _, workflow := range dequeuedWorkflows {
 				// Find the workflow in the registry
@@ -157,7 +164,7 @@ func queueRunner(ctx context.Context) {
 					}
 				}
 
-				_, err := registeredWorkflow.wrappedFunction(ctx, input, WithWorkflowID(workflow.id))
+				_, err := registeredWorkflow.wrappedFunction(runnerContext, input, WithWorkflowID(workflow.id))
 				if err != nil {
 					fmt.Println("Error recovering workflow:", err)
 				}

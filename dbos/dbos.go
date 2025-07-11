@@ -9,6 +9,9 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 var (
@@ -51,11 +54,14 @@ type Executor interface {
 	Shutdown()
 }
 
+var workflowScheduler *cron.Cron
+
 // DBOS represents the main DBOS instance
 type executor struct {
 	systemDB              SystemDatabase
 	queueRunnerCtx        context.Context
 	queueRunnerCancelFunc context.CancelFunc
+	queueRunnerDone       chan struct{}
 }
 
 // New creates a new DBOS instance with an initialized system database
@@ -103,11 +109,23 @@ func Launch() error {
 		systemDB:              systemDB,
 		queueRunnerCtx:        ctx,
 		queueRunnerCancelFunc: cancel,
+		queueRunnerDone:       make(chan struct{}),
 	}
 
 	// Start the queue runner in a goroutine
-	go queueRunner(ctx)
+	go func() {
+		defer close(dbos.queueRunnerDone)
+		queueRunner(ctx)
+	}()
 	fmt.Println("DBOS: Queue runner started")
+
+	// Start the workflow scheduler if it has been initialized
+	if workflowScheduler != nil {
+		workflowScheduler.Start()
+		fmt.Println("DBOS: Workflow scheduler started")
+	}
+
+	// TODO run a round of recovery on the local executor
 
 	fmt.Printf("DBOS: Initialized with APP_VERSION=%s, EXECUTOR_ID=%s\n", APP_VERSION, EXECUTOR_ID)
 	return nil
@@ -123,10 +141,28 @@ func Shutdown() {
 	// Cancel the context to stop the queue runner
 	if dbos.queueRunnerCancelFunc != nil {
 		dbos.queueRunnerCancelFunc()
+		// Wait for queue runner to finish
+		<-dbos.queueRunnerDone
+		fmt.Println("DBOS: Queue runner stopped")
+	}
+
+	if workflowScheduler != nil {
+		ctx := workflowScheduler.Stop()
+		// Wait for all running jobs to complete with 5-second timeout
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		select {
+		case <-ctx.Done():
+			fmt.Println("DBOS: All scheduled jobs completed")
+		case <-timeoutCtx.Done():
+			fmt.Println("DBOS: Timeout waiting for jobs to complete (5s)")
+		}
 	}
 
 	if dbos.systemDB != nil {
 		dbos.systemDB.Shutdown()
 	}
+
 	dbos = nil // Mark the DBOS instance for garbage collection
 }
