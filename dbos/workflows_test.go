@@ -1,14 +1,13 @@
 package dbos
 
 /**
-This suite tests high level DBOS features:
-	[x] Wrapping various golang methods in DBOS workflows
-	[x] wf idempotency
-	[x] encoding / decoding of input/outputs
-	[] workflow retries
-	[] workflow conflicting name
-	[] wf timeout
-	[] wf deadlines
+Test workflow and steps features
+[x] Wrapping various golang methods in DBOS workflows
+[x] workflow idempotency
+[x] workflow DLQ
+[] workflow conflicting name
+[] workflow timeout
+[] workflow deadlines
 */
 
 import (
@@ -25,28 +24,11 @@ import (
 // Global counter for idempotency testing
 var idempotencyCounter int64
 
-// Test struct types for encoding/decoding
-type SimpleStruct struct {
-	Name  string `json:"name"`
-	Value int    `json:"value"`
-}
-
-type StepInputStruct struct {
-	Data SimpleStruct `json:"data"`
-	ID   string       `json:"id"`
-}
-
-type StepOutputStruct struct {
-	Input    StepInputStruct `json:"input"`
-	StepInfo string          `json:"step_info"`
-}
-
 var (
-	simpleWf                  = WithWorkflow(simpleWorkflow)
-	simpleWfError             = WithWorkflow(simpleWorkflowError)
-	simpleWfWithStep          = WithWorkflow(simpleWorkflowWithStep)
-	simpleWfWithStepError     = WithWorkflow(simpleWorkflowWithStepError)
-	simpleWfWithChildWorkflow = WithWorkflow(simpleWorkflowWithChildWorkflow)
+	simpleWf              = WithWorkflow(simpleWorkflow)
+	simpleWfError         = WithWorkflow(simpleWorkflowError)
+	simpleWfWithStep      = WithWorkflow(simpleWorkflowWithStep)
+	simpleWfWithStepError = WithWorkflow(simpleWorkflowWithStepError)
 	// struct methods
 	s              = workflowStruct{}
 	simpleWfStruct = WithWorkflow(s.simpleWorkflow)
@@ -66,8 +48,6 @@ var (
 	// Workflow for idempotency testing
 	idempotencyWf         = WithWorkflow(idempotencyWorkflow)
 	idempotencyWfWithStep = WithWorkflow(idempotencyWorkflowWithStep)
-	// Workflow for struct encoding testing
-	structWfWithStep = WithWorkflow(structWorkflowWithStep)
 )
 
 func simpleWorkflow(ctxt context.Context, input string) (string, error) {
@@ -92,14 +72,6 @@ func simpleStepError(ctx context.Context, input string) (string, error) {
 
 func simpleWorkflowWithStepError(ctx context.Context, input string) (string, error) {
 	return RunAsStep(ctx, simpleStepError, input)
-}
-
-func simpleWorkflowWithChildWorkflow(ctx context.Context, input string) (string, error) {
-	childHandle, err := simpleWfWithStep(ctx, input) // This ctx is mandatory because it holds the DBOS state with the parent workflow ID
-	if err != nil {
-		return "", err
-	}
-	return childHandle.GetResult(ctx)
 }
 
 // idempotencyWorkflow increments a global counter and returns the input
@@ -127,18 +99,6 @@ func idempotencyWorkflowWithStep(ctx context.Context, input string) (int64, erro
 	idempotencyWorkflowWithStepEvent.Set()
 	RunAsStep(ctx, blockingStep, input)
 	return idempotencyCounter, nil
-}
-
-// complexStructWorkflow processes a StepInputStruct using a step and returns the step result
-func structWorkflowWithStep(ctx context.Context, input StepInputStruct) (StepOutputStruct, error) {
-	return RunAsStep(ctx, simpleStructStep, input)
-}
-
-func simpleStructStep(ctx context.Context, input StepInputStruct) (StepOutputStruct, error) {
-	return StepOutputStruct{
-		Input:    input,
-		StepInfo: "processed by simpleStructStep",
-	}, nil
 }
 
 // Unified struct that demonstrates both pointer and value receiver methods
@@ -178,6 +138,7 @@ var (
 	})
 )
 
+// TODO: spin into dbos_test.go
 func TestAppVersion(t *testing.T) {
 	if _, err := hex.DecodeString(APP_VERSION); err != nil {
 		t.Fatalf("APP_VERSION is not a valid hex string: %v", err)
@@ -206,11 +167,6 @@ func TestAppVersion(t *testing.T) {
 
 func TestWorkflowsWrapping(t *testing.T) {
 	setupDBOS(t)
-
-	// Eventually remove this, convenient for testing
-	for k, v := range registry {
-		fmt.Printf("Registered workflow: %s -> %T\n", k, v)
-	}
 
 	type testCase struct {
 		name           string
@@ -350,19 +306,6 @@ func TestWorkflowsWrapping(t *testing.T) {
 			expectError:    false,
 		},
 		{
-			name: "SimpleWorkflowWithChildWorkflow",
-			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
-				handle, err := simpleWfWithChildWorkflow(ctx, input, opts...)
-				if err != nil {
-					return nil, err
-				}
-				return handle.GetResult(ctx)
-			},
-			input:          "echo",
-			expectedResult: "from step",
-			expectError:    false,
-		},
-		{
 			name: "SimpleWorkflowWithStepError",
 			workflowFunc: func(ctx context.Context, input string, opts ...WorkflowOption) (any, error) {
 				handle, err := simpleWfWithStepError(ctx, input, opts...)
@@ -401,44 +344,99 @@ func TestWorkflowsWrapping(t *testing.T) {
 }
 
 var (
-	parentWf = WithWorkflow(func(ctx context.Context, wfid string) (string, error) {
-		childHandle, err := simpleWfWithChildWorkflow(ctx, wfid)
+	childWf = WithWorkflow(func(ctx context.Context, i int) (string, error) {
+		workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
+		if !ok {
+			return "", fmt.Errorf("workflow state not found in context")
+		}
+		fmt.Println("childWf workflow state:", workflowState)
+		expectedCurrentID := fmt.Sprintf("%s-%d", workflowState.WorkflowID, i)
+		if workflowState.WorkflowID != expectedCurrentID {
+			return "", fmt.Errorf("expected parentWf workflow ID to be %s, got %s", expectedCurrentID, workflowState.WorkflowID)
+		}
+		// XXX right now the steps of a child workflow start with an incremented step ID, because the first step ID is allocated to the child workflow
+		return RunAsStep(ctx, simpleStep, "")
+	})
+	parentWf = WithWorkflow(func(ctx context.Context, i int) (string, error) {
+		workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
+		if !ok {
+			return "", fmt.Errorf("workflow state not found in context")
+		}
+		fmt.Println("parentWf workflow state:", workflowState)
+
+		childHandle, err := childWf(ctx, i)
 		if err != nil {
 			return "", err
 		}
-		// Verify child workflow ID follows the pattern: parentID-functionID
-		childWorkflowID := childHandle.GetWorkflowID()
-		expectedPrefix := wfid + "-0"
-		if childWorkflowID != expectedPrefix {
-			return "", fmt.Errorf("expected child workflow ID to be %s, got %s", expectedPrefix, childWorkflowID)
+
+		// Check this wf ID is built correctly
+		expectedParentID := fmt.Sprintf("%s-%d", workflowState.WorkflowID, i)
+		if workflowState.WorkflowID != expectedParentID {
+			return "", fmt.Errorf("expected parentWf workflow ID to be %s, got %s", expectedParentID, workflowState.WorkflowID)
 		}
 
+		// Verify child workflow ID follows the pattern: parentID-functionID
+		childWorkflowID := childHandle.GetWorkflowID()
+		expectedChildID := fmt.Sprintf("%s-%d", workflowState.WorkflowID, i)
+		if childWorkflowID != expectedChildID {
+			return "", fmt.Errorf("expected childWf ID to be %s, got %s", expectedChildID, childWorkflowID)
+		}
 		return childHandle.GetResult(ctx)
+	})
+	grandParentWf = WithWorkflow(func(ctx context.Context, _ string) (string, error) {
+		for i := range 3 {
+			workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
+			if !ok {
+				return "", fmt.Errorf("workflow state not found in context")
+			}
+			fmt.Println("grandParentWf workflow state:", workflowState)
+
+			childHandle, err := parentWf(ctx, i)
+			if err != nil {
+				return "", err
+			}
+
+			// The handle should a direct handle
+			_, ok = childHandle.(*workflowHandle[string])
+			if !ok {
+				return "", fmt.Errorf("expected childHandle to be of type *workflowHandle[string], got %T", childHandle)
+			}
+
+			// Verify child workflow ID follows the pattern: parentID-functionID
+			childWorkflowID := childHandle.GetWorkflowID()
+			expectedPrefix := fmt.Sprintf("%s-%d", workflowState.WorkflowID, i)
+			if childWorkflowID != expectedPrefix {
+				return "", fmt.Errorf("expected parentWf workflow ID to be %s, got %s", expectedPrefix, childWorkflowID)
+			}
+
+			// Calling the child a second time should return a polling handle
+			childHandle, err = parentWf(ctx, i, WithWorkflowID(childHandle.GetWorkflowID()))
+			if err != nil {
+				return "", err
+			}
+			_, ok = childHandle.(*workflowPollingHandle[string])
+			if !ok {
+				return "", fmt.Errorf("expected childHandle to be of type *workflowPollingHandle[string], got %T", childHandle)
+			}
+
+		}
+
+		return "", nil
 	})
 )
 
+// TODO Check timeouts behaviors for parents and children (e.g. awaited cancelled, etc)
 func TestChildWorkflow(t *testing.T) {
 	setupDBOS(t)
 
 	t.Run("ChildWorkflowIDPattern", func(t *testing.T) {
-		parentWorkflowID := uuid.NewString()
-
-		// Execute the parent workflow
-		parentHandle, err := parentWf(context.Background(), parentWorkflowID, WithWorkflowID(parentWorkflowID))
+		h, err := grandParentWf(context.Background(), "")
 		if err != nil {
-			t.Fatalf("failed to execute parent workflow: %v", err)
+			t.Fatalf("failed to execute grand parent workflow: %v", err)
 		}
-
-		// Verify the result
-		result, err := parentHandle.GetResult(context.Background())
+		_, err = h.GetResult(context.Background())
 		if err != nil {
-			t.Fatalf("expected no error but got: %v", err)
-		}
-
-		// The result should be from the child workflow's step
-		expectedResult := "from step"
-		if result != expectedResult {
-			t.Fatalf("expected result %v but got %v", expectedResult, result)
+			t.Fatalf("failed to get result from grand parent workflow: %v", err)
 		}
 	})
 }
@@ -473,6 +471,12 @@ func TestWorkflowIdempotency(t *testing.T) {
 			t.Fatalf("failed to get result from second execution: %v", err)
 		}
 
+		// Verify the second handle is a polling handle
+		_, ok := handle2.(*workflowPollingHandle[string])
+		if !ok {
+			t.Fatalf("expected handle2 to be of type workflowPollingHandle, got %T", handle2)
+		}
+
 		// Verify both executions return the same result
 		if result1 != result2 {
 			t.Fatalf("expected same result from both executions, got %v and %v", result1, result2)
@@ -485,122 +489,6 @@ func TestWorkflowIdempotency(t *testing.T) {
 	})
 }
 
-func TestWorkflowEncoding(t *testing.T) {
-	setupDBOS(t)
-
-	t.Run("BuiltInType", func(t *testing.T) {
-		// Test a workflow that uses a built-in type (string)
-		handle, err := simpleWf(context.Background(), "test")
-		if err != nil {
-			t.Fatalf("failed to execute workflow: %v", err)
-		}
-
-		// Block until the workflow completes
-		_, err = handle.GetResult(context.Background())
-		if err != nil {
-			t.Fatalf("expected no error but got: %v", err)
-		}
-
-		retrieveHandler, err := RetrieveWorkflow[string](handle.GetWorkflowID())
-		if err != nil {
-			t.Fatalf("failed to retrieve workflow: %v", err)
-		}
-		retrievedResult, err := retrieveHandler.GetResult(context.Background())
-		if err != nil {
-			t.Fatalf("expected no error but got: %v", err)
-		}
-		if retrievedResult != "test" {
-			t.Fatalf("expected retrieved result to be 'test', got %v", retrievedResult)
-		}
-	})
-
-	t.Run("StructType", func(t *testing.T) {
-		// Test a workflow that calls a step with struct types to verify serialization/deserialization
-		input := SimpleStruct{Name: "test", Value: 123}
-		stepInput := StepInputStruct{
-			Data: input,
-			ID:   "step-test",
-		}
-
-		stepHandle, err := structWfWithStep(context.Background(), stepInput)
-		if err != nil {
-			t.Fatalf("failed to execute step workflow: %v", err)
-		}
-
-		// Block until the workflow completes
-		_, err = stepHandle.GetResult(context.Background())
-		if err != nil {
-			t.Fatalf("expected no error but got: %v", err)
-		}
-
-		// Test output deserialization from the workflow_status table
-		stepRetrieveHandler, err := RetrieveWorkflow[StepOutputStruct](stepHandle.GetWorkflowID())
-		if err != nil {
-			t.Fatalf("failed to retrieve step workflow: %v", err)
-		}
-		stepRetrievedResult, err := stepRetrieveHandler.GetResult(context.Background())
-		if err != nil {
-			t.Fatalf("expected no error but got: %v", err)
-		}
-
-		if stepRetrievedResult.Input.ID != stepInput.ID {
-			t.Fatalf("expected step input ID to be %v, got %v", stepInput.ID, stepRetrievedResult.Input.ID)
-		}
-		if stepRetrievedResult.Input.Data.Name != input.Name {
-			t.Fatalf("expected step input data name to be %v, got %v", input.Name, stepRetrievedResult.Input.Data.Name)
-		}
-		if stepRetrievedResult.Input.Data.Value != input.Value {
-			t.Fatalf("expected step input data value to be %v, got %v", input.Value, stepRetrievedResult.Input.Data.Value)
-		}
-		if stepRetrievedResult.StepInfo != "processed by simpleStructStep" {
-			t.Fatalf("expected step info to be 'processed by simpleStructStep', got %v", stepRetrievedResult.StepInfo)
-		}
-
-		// Test input/output deserialization from the workflow_status table
-		workflows, err := getExecutor().systemDB.ListWorkflows(context.Background(), ListWorkflowsDBInput{
-			WorkflowIDs: []string{stepHandle.GetWorkflowID()},
-		})
-		if err != nil {
-			t.Fatalf("failed to list workflows: %v", err)
-		}
-		workflow := workflows[0]
-		if workflow.Input == nil {
-			t.Fatal("expected workflow input to be non-nil")
-		}
-		workflowInput, ok := workflow.Input.(StepInputStruct)
-		if !ok {
-			t.Fatalf("expected workflow input to be of type StepInputStruct, got %T", workflow.Input)
-		}
-		if workflowInput.ID != stepInput.ID {
-			t.Fatalf("expected workflow input ID to be %v, got %v", stepInput.ID, workflowInput.ID)
-		}
-		if workflowInput.Data.Name != input.Name {
-			t.Fatalf("expected workflow input data name to be %v, got %v", input.Name, workflowInput.Data.Name)
-		}
-		if workflowInput.Data.Value != input.Value {
-			t.Fatalf("expected workflow input data value to be %v, got %v", input.Value, workflowInput.Data.Value)
-		}
-
-		workflowOutput, ok := workflow.Output.(StepOutputStruct)
-		if !ok {
-			t.Fatalf("expected workflow output to be of type StepOutputStruct, got %T", workflow.Output)
-		}
-		if workflowOutput.Input.ID != stepInput.ID {
-			t.Fatalf("expected workflow output input ID to be %v, got %v", stepInput.ID, workflowOutput.Input.ID)
-		}
-		if workflowOutput.Input.Data.Name != input.Name {
-			t.Fatalf("expected workflow output input data name to be %v, got %v", input.Name, workflowOutput.Input.Data.Name)
-		}
-		if workflowOutput.Input.Data.Value != input.Value {
-			t.Fatalf("expected workflow output input data value to be %v, got %v", input.Value, workflowOutput.Input.Data.Value)
-		}
-		if workflowOutput.StepInfo != "processed by simpleStructStep" {
-			t.Fatalf("expected workflow output step info to be 'processed by simpleStructStep', got %v", workflowOutput.StepInfo)
-		}
-
-		// TODO: test output deserialization from the operation_results table
-	})
-}
 func TestWorkflowRecovery(t *testing.T) {
 	setupDBOS(t)
 
@@ -884,7 +772,6 @@ var (
 		}
 		return fmt.Sprintf("Scheduled workflow scheduled at time %v and executed at time %v", scheduledTime, startTime), nil
 	}, WithSchedule("* * * * * *")) // Every second
-
 )
 
 func TestScheduledWorkflows(t *testing.T) {
