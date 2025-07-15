@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"runtime"
 	"sync"
@@ -55,8 +56,9 @@ type WorkflowStatus struct {
 
 // WorkflowState holds the runtime state for a workflow execution
 type WorkflowState struct {
-	WorkflowID  string
-	stepCounter int
+	WorkflowID   string
+	stepCounter  int
+	isWithinStep bool
 }
 
 // NextStepID returns the next step ID and increments the counter
@@ -554,24 +556,40 @@ func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], inp
 type StepFunc[P any, R any] func(ctx context.Context, input P) (R, error)
 
 type StepParams struct {
-	MaxAttempts int
-	BackoffRate int
+	MaxRetries    int
+	BackoffFactor float64
+	BaseInterval  time.Duration
+	MaxInterval   time.Duration
 }
 
 // StepOption is a functional option for configuring step parameters
 type StepOption func(*StepParams)
 
-// WithMaxAttempts sets the maximum number of retry attempts for a step
-func WithMaxAttempts(maxAttempts int) StepOption {
+// WithStepMaxRetries sets the maximum number of retries for a step
+func WithStepMaxRetries(maxRetries int) StepOption {
 	return func(p *StepParams) {
-		p.MaxAttempts = maxAttempts
+		p.MaxRetries = maxRetries
 	}
 }
 
-// WithBackoffRate sets the backoff rate for retries
-func WithBackoffRate(backoffRate int) StepOption {
+// WithBackoffFactor sets the backoff factor for retries (multiplier for exponential backoff)
+func WithBackoffFactor(backoffFactor float64) StepOption {
 	return func(p *StepParams) {
-		p.BackoffRate = backoffRate
+		p.BackoffFactor = backoffFactor
+	}
+}
+
+// WithBaseInterval sets the base delay for the first retry
+func WithBaseInterval(baseInterval time.Duration) StepOption {
+	return func(p *StepParams) {
+		p.BaseInterval = baseInterval
+	}
+}
+
+// WithMaxInterval sets the maximum delay for retries
+func WithMaxInterval(maxInterval time.Duration) StepOption {
+	return func(p *StepParams) {
+		p.MaxInterval = maxInterval
 	}
 }
 
@@ -582,8 +600,13 @@ func RunAsStep[P any, R any](ctx context.Context, fn StepFunc[P, R], input P, op
 
 	operationName := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
 
-	// Apply options to build params
-	params := StepParams{}
+	// Apply options to build params with defaults
+	params := StepParams{
+		MaxRetries:    0,
+		BackoffFactor: 2.0,
+		BaseInterval:  500 * time.Millisecond,
+		MaxInterval:   1 * time.Hour,
+	}
 	for _, opt := range opts {
 		opt(&params)
 	}
@@ -591,7 +614,12 @@ func RunAsStep[P any, R any](ctx context.Context, fn StepFunc[P, R], input P, op
 	// Get workflow state from context
 	workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
 	if !ok || workflowState == nil {
-		return *new(R), NewStepExecutionError("", operationName, "workflow state not found in context")
+		return *new(R), NewStepExecutionError("", operationName, "workflow state not found in context: are you running this step within a workflow?")
+	}
+
+	// If within a step, just run the function directly
+	if workflowState.isWithinStep {
+		return fn(ctx, input)
 	}
 
 	// Get next step ID
@@ -610,7 +638,59 @@ func RunAsStep[P any, R any](ctx context.Context, fn StepFunc[P, R], input P, op
 		return recordedOutput.output.(R), recordedOutput.err
 	}
 
-	stepOutput, stepError := fn(ctx, input)
+	// Execute step with retry logic if MaxRetries > 0
+	stepState := WorkflowState{
+		WorkflowID:   workflowState.WorkflowID,
+		stepCounter:  workflowState.stepCounter,
+		isWithinStep: true,
+	}
+	stepCtx := context.WithValue(ctx, WorkflowStateKey, &stepState)
+
+	stepOutput, stepError := fn(stepCtx, input)
+
+	// Retry if MaxRetries > 0 and the first execution failed
+	var joinedErrors error
+	if stepError != nil && params.MaxRetries > 0 {
+		joinedErrors = errors.Join(joinedErrors, stepError)
+
+		for retry := 1; retry <= params.MaxRetries; retry++ {
+			// Calculate delay for exponential backoff
+			delay := params.BaseInterval
+			if retry > 1 {
+				exponentialDelay := float64(params.BaseInterval) * math.Pow(params.BackoffFactor, float64(retry-1))
+				delay = time.Duration(math.Min(exponentialDelay, float64(params.MaxInterval)))
+			}
+
+			fmt.Printf("step %s failed, retrying %d/%d in %v: %v\n", operationName, retry, params.MaxRetries, delay, stepError)
+
+			// Wait before retry
+			select {
+			case <-ctx.Done():
+				return *new(R), NewStepExecutionError(workflowState.WorkflowID, operationName, fmt.Sprintf("context cancelled during retry: %v", ctx.Err()))
+			case <-time.After(delay):
+				// Continue to retry
+			}
+
+			// Execute the retry
+			stepOutput, stepError = fn(stepCtx, input)
+
+			// If successful, break
+			if stepError == nil {
+				break
+			}
+
+			// Join the error with existing errors
+			joinedErrors = errors.Join(joinedErrors, stepError)
+
+			// If max retries reached, create MaxStepRetriesExceeded error
+			if retry == params.MaxRetries {
+				stepError = NewMaxStepRetriesExceededError(workflowState.WorkflowID, operationName, params.MaxRetries, joinedErrors)
+				break
+			}
+		}
+	}
+
+	// Record the final result
 	dbInput := recordOperationResultDBInput{
 		workflowID:    workflowState.WorkflowID,
 		operationName: operationName,
@@ -620,9 +700,9 @@ func RunAsStep[P any, R any](ctx context.Context, fn StepFunc[P, R], input P, op
 	}
 	recErr := getExecutor().systemDB.RecordOperationResult(ctx, dbInput)
 	if recErr != nil {
-		// fmt.Println("failed to record step error:", err)
-		return *new(R), NewStepExecutionError(workflowState.WorkflowID, operationName, fmt.Sprintf("recording step outcome: %v", err))
+		return *new(R), NewStepExecutionError(workflowState.WorkflowID, operationName, fmt.Sprintf("recording step outcome: %v", recErr))
 	}
+
 	return stepOutput, stepError
 }
 

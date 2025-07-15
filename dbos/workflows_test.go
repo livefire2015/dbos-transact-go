@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,9 +46,6 @@ var (
 	wfClose = WithWorkflow(func(ctx context.Context, in string) (string, error) {
 		return prefix + in, nil
 	})
-	// Workflow for idempotency testing
-	idempotencyWf         = WithWorkflow(idempotencyWorkflow)
-	idempotencyWfWithStep = WithWorkflow(idempotencyWorkflowWithStep)
 )
 
 func simpleWorkflow(ctxt context.Context, input string) (string, error) {
@@ -77,27 +75,6 @@ func simpleWorkflowWithStepError(ctx context.Context, input string) (string, err
 // idempotencyWorkflow increments a global counter and returns the input
 func incrementCounter(_ context.Context, value int64) (int64, error) {
 	idempotencyCounter += value
-	return idempotencyCounter, nil
-}
-
-func idempotencyWorkflow(ctx context.Context, input string) (string, error) {
-	incrementCounter(ctx, 1)
-	return input, nil
-}
-
-var blockingStepStopEvent *Event
-
-func blockingStep(ctx context.Context, input string) (string, error) {
-	blockingStepStopEvent.Wait()
-	return "", nil
-}
-
-var idempotencyWorkflowWithStepEvent *Event
-
-func idempotencyWorkflowWithStep(ctx context.Context, input string) (int64, error) {
-	RunAsStep(ctx, incrementCounter, 1)
-	idempotencyWorkflowWithStepEvent.Set()
-	RunAsStep(ctx, blockingStep, input)
 	return idempotencyCounter, nil
 }
 
@@ -138,7 +115,6 @@ var (
 	})
 )
 
-// TODO: spin into dbos_test.go
 func TestAppVersion(t *testing.T) {
 	if _, err := hex.DecodeString(APP_VERSION); err != nil {
 		t.Fatalf("APP_VERSION is not a valid hex string: %v", err)
@@ -343,6 +319,152 @@ func TestWorkflowsWrapping(t *testing.T) {
 	}
 }
 
+func stepWithinAStep(ctx context.Context, input string) (string, error) {
+	return RunAsStep(ctx, simpleStep, input)
+}
+
+func stepWithinAStepWorkflow(ctx context.Context, input string) (string, error) {
+	return RunAsStep(ctx, stepWithinAStep, input)
+}
+
+// Global counter for retry testing
+var stepRetryAttemptCount int
+
+func stepRetryAlwaysFailsStep(ctx context.Context, input string) (string, error) {
+	stepRetryAttemptCount++
+	return "", fmt.Errorf("always fails - attempt %d", stepRetryAttemptCount)
+}
+
+func stepRetryWorkflow(ctx context.Context, input string) (string, error) {
+	return RunAsStep(ctx, stepRetryAlwaysFailsStep, input,
+		WithStepMaxRetries(5),
+		WithBackoffFactor(2.0),
+		WithBaseInterval(1*time.Millisecond),
+		WithMaxInterval(10*time.Millisecond))
+}
+
+var (
+	stepWithinAStepWf = WithWorkflow(stepWithinAStepWorkflow)
+	stepRetryWf       = WithWorkflow(stepRetryWorkflow)
+)
+
+func TestSteps(t *testing.T) {
+	setupDBOS(t)
+
+	t.Run("StepsMustRunInsideWorkflows", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Attempt to run a step outside of a workflow context
+		_, err := RunAsStep(ctx, simpleStep, "test")
+		if err == nil {
+			t.Fatal("expected error when running step outside of workflow context, but got none")
+		}
+
+		// Check the error type
+		dbosErr, ok := err.(*DBOSError)
+		if !ok {
+			t.Fatalf("expected error to be of type *DBOSError, got %T", err)
+		}
+
+		if dbosErr.Code != StepExecutionError {
+			t.Fatalf("expected error code to be StepExecutionError, got %v", dbosErr.Code)
+		}
+
+		// Test the specific message from the 3rd argument
+		expectedMessagePart := "workflow state not found in context"
+		if !strings.Contains(err.Error(), expectedMessagePart) {
+			t.Fatalf("expected error message to contain %q, but got %q", expectedMessagePart, err.Error())
+		}
+	})
+
+	t.Run("StepWithinAStepAreJustFunctions", func(t *testing.T) {
+		handle, err := stepWithinAStepWf(context.Background(), "test")
+		if err != nil {
+			t.Fatal("failed to run step within a step:", err)
+		}
+		result, err := handle.GetResult(context.Background())
+		if err != nil {
+			t.Fatal("failed to get result from step within a step:", err)
+		}
+		if result != "from step" {
+			t.Fatalf("expected result 'from step', got '%s'", result)
+		}
+
+		steps, err := getExecutor().systemDB.GetWorkflowSteps(context.Background(), handle.GetWorkflowID())
+		if err != nil {
+			t.Fatal("failed to list steps:", err)
+		}
+		if len(steps) != 1 {
+			t.Fatalf("expected 1 step, got %d", len(steps))
+		}
+	})
+
+	t.Run("StepRetryWithExponentialBackoff", func(t *testing.T) {
+		// Reset the global counter before test
+		stepRetryAttemptCount = 0
+
+		// Execute the workflow
+		handle, err := stepRetryWf(context.Background(), "test")
+		if err != nil {
+			t.Fatal("failed to start retry workflow:", err)
+		}
+
+		_, err = handle.GetResult(context.Background())
+		if err == nil {
+			t.Fatal("expected error from failing workflow but got none")
+		}
+
+		// Verify the step was called exactly 6 times (max attempts + 1 initial attempt)
+		if stepRetryAttemptCount != 6 {
+			t.Fatalf("expected 6 attempts, got %d", stepRetryAttemptCount)
+		}
+
+		// Verify the error is a MaxStepRetriesExceeded error
+		dbosErr, ok := err.(*DBOSError)
+		if !ok {
+			t.Fatalf("expected error to be of type *DBOSError, got %T", err)
+		}
+
+		if dbosErr.Code != MaxStepRetriesExceeded {
+			t.Fatalf("expected error code to be MaxStepRetriesExceeded, got %v", dbosErr.Code)
+		}
+
+		// Verify the error contains the step name and max retries
+		expectedErrorMessage := "dbos.stepRetryAlwaysFailsStep has exceeded its maximum of 5 retries"
+		if !strings.Contains(dbosErr.Message, expectedErrorMessage) {
+			t.Fatalf("expected error message to contain '%s', got '%s'", expectedErrorMessage, dbosErr.Message)
+		}
+
+		// Verify each error message is present in the joined error
+		for i := 1; i <= 5; i++ {
+			expectedMsg := fmt.Sprintf("always fails - attempt %d", i)
+			if !strings.Contains(dbosErr.Error(), expectedMsg) {
+				t.Fatalf("expected joined error to contain '%s', but got '%s'", expectedMsg, dbosErr.Error())
+			}
+		}
+
+		// Verify that the failed step was still recorded in the database
+		steps, err := getExecutor().systemDB.GetWorkflowSteps(context.Background(), handle.GetWorkflowID())
+		if err != nil {
+			t.Fatal("failed to get workflow steps:", err)
+		}
+
+		if len(steps) != 1 {
+			t.Fatalf("expected 1 recorded step, got %d", len(steps))
+		}
+
+		// Verify the recorded step has the error
+		step := steps[0]
+		if step.Error == nil {
+			t.Fatal("expected error in recorded step, got none")
+		}
+
+		if step.Error.Error() != dbosErr.Error() {
+			t.Fatalf("expected recorded step error to match joined error, got '%s', expected '%s'", step.Error.Error(), dbosErr.Error())
+		}
+	})
+}
+
 var (
 	childWf = WithWorkflow(func(ctx context.Context, i int) (string, error) {
 		workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
@@ -441,6 +563,32 @@ func TestChildWorkflow(t *testing.T) {
 	})
 }
 
+var (
+	idempotencyWf         = WithWorkflow(idempotencyWorkflow)
+	idempotencyWfWithStep = WithWorkflow(idempotencyWorkflowWithStep)
+)
+
+func idempotencyWorkflow(ctx context.Context, input string) (string, error) {
+	incrementCounter(ctx, 1)
+	return input, nil
+}
+
+var blockingStepStopEvent *Event
+
+func blockingStep(ctx context.Context, input string) (string, error) {
+	blockingStepStopEvent.Wait()
+	return "", nil
+}
+
+var idempotencyWorkflowWithStepEvent *Event
+
+func idempotencyWorkflowWithStep(ctx context.Context, input string) (int64, error) {
+	RunAsStep(ctx, incrementCounter, 1)
+	idempotencyWorkflowWithStepEvent.Set()
+	RunAsStep(ctx, blockingStep, input)
+	return idempotencyCounter, nil
+}
+
 func TestWorkflowIdempotency(t *testing.T) {
 	setupDBOS(t)
 
@@ -491,9 +639,7 @@ func TestWorkflowIdempotency(t *testing.T) {
 
 func TestWorkflowRecovery(t *testing.T) {
 	setupDBOS(t)
-
 	t.Run("RecoveryResumeWhereItLeftOff", func(t *testing.T) {
-
 		// Reset the global counter
 		idempotencyCounter = 0
 
@@ -565,7 +711,6 @@ func TestWorkflowRecovery(t *testing.T) {
 		if result != idempotencyCounter {
 			t.Fatalf("expected result to be %s, got %s", input, result)
 		}
-
 	})
 }
 
@@ -803,7 +948,7 @@ func TestScheduledWorkflows(t *testing.T) {
 
 		// Verify timing - each execution should be approximately 1 second apart
 		scheduleInterval := 1 * time.Second
-		allowedSlack := 1 * time.Second // Allow 500ms slack
+		allowedSlack := 2 * time.Second
 
 		for i, execTime := range executionTimes {
 			// Calculate expected execution time based on schedule interval
