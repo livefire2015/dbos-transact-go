@@ -2,6 +2,8 @@ package dbos
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 	"os"
 	"sync"
 	"testing"
@@ -16,7 +18,8 @@ func setupDBOS(t *testing.T) {
 
 	databaseURL := os.Getenv("DBOS_DATABASE_URL")
 	if databaseURL == "" {
-		t.Skip("DBOS_DATABASE_URL not set, skipping integration test")
+		password := url.QueryEscape(os.Getenv("PGPASSWORD"))
+		databaseURL = fmt.Sprintf("postgres://postgres:%s@localhost:5432/dbos?sslmode=disable", password)
 	}
 
 	// Clean up the test database
