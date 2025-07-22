@@ -16,7 +16,7 @@ import (
 func setupDBOS(t *testing.T) {
 	t.Helper()
 
-	databaseURL := os.Getenv("DBOS_DATABASE_URL")
+	databaseURL := os.Getenv("DBOS_SYSTEM_DATABASE_URL")
 	if databaseURL == "" {
 		password := url.QueryEscape(os.Getenv("PGPASSWORD"))
 		databaseURL = fmt.Sprintf("postgres://postgres:%s@localhost:5432/dbos?sslmode=disable", password)
@@ -30,7 +30,7 @@ func setupDBOS(t *testing.T) {
 
 	dbName := parsedURL.Database
 	if dbName == "" {
-		t.Skip("DBOS_DATABASE_URL does not specify a database name, skipping integration test")
+		t.Skip("DBOS_SYSTEM_DATABASE_URL does not specify a database name, skipping integration test")
 	}
 
 	postgresURL := parsedURL.Copy()
@@ -97,6 +97,33 @@ func (e *Event) Clear() {
 }
 
 /* Helpers */
+
+// stopQueueRunner stops the queue runner for testing purposes
+func stopQueueRunner() {
+	if dbos != nil && dbos.queueRunnerCancelFunc != nil {
+		dbos.queueRunnerCancelFunc()
+		// Wait for queue runner to finish
+		<-dbos.queueRunnerDone
+	}
+}
+
+// restartQueueRunner restarts the queue runner for testing purposes
+func restartQueueRunner() {
+	if dbos != nil {
+		// Create new context and cancel function
+		ctx, cancel := context.WithCancel(context.Background())
+		dbos.queueRunnerCtx = ctx
+		dbos.queueRunnerCancelFunc = cancel
+		dbos.queueRunnerDone = make(chan struct{})
+		
+		// Start the queue runner in a goroutine
+		go func() {
+			defer close(dbos.queueRunnerDone)
+			queueRunner(ctx)
+		}()
+	}
+}
+
 func equal(a, b []int) bool {
 	if len(a) != len(b) {
 		return false
@@ -126,7 +153,7 @@ func queueEntriesAreCleanedUp() bool {
 					AND status IN ('ENQUEUED', 'PENDING')`
 
 		var count int
-		err = tx.QueryRow(context.Background(), query, DBOS_INTERNAL_QUEUE_NAME).Scan(&count)
+		err = tx.QueryRow(context.Background(), query, _DBOS_INTERNAL_QUEUE_NAME).Scan(&count)
 		tx.Rollback(context.Background()) // Clean up transaction
 
 		if err != nil {

@@ -5,8 +5,6 @@ import (
 	"embed"
 	"errors"
 	"fmt"
-	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -89,6 +87,7 @@ func createDatabaseIfNotExists(databaseURL string) error {
 		if err != nil {
 			return NewInitializationError(fmt.Sprintf("failed to create database %s: %v", dbName, err))
 		}
+		getLogger().Info("Database created", "name", dbName)
 	}
 
 	return nil
@@ -125,36 +124,28 @@ func runMigrations(databaseURL string) error {
 }
 
 // New creates a new SystemDatabase instance and runs migrations
-func NewSystemDatabase() (SystemDatabase, error) {
-	// TODO: pass proper config
-	databaseURL := os.Getenv("DBOS_DATABASE_URL")
-	if databaseURL == "" {
-		fmt.Println("DBOS_DATABASE_URL not set, using default: postgres://postgres:${PGPASSWORD}@localhost:5432/dbos?sslmode=disable")
-		password := url.QueryEscape(os.Getenv("PGPASSWORD"))
-		databaseURL = fmt.Sprintf("postgres://postgres:%s@localhost:5432/dbos?sslmode=disable", password)
-	}
-
+func NewSystemDatabase(databaseURL string) (SystemDatabase, error) {
 	// Create the database if it doesn't exist
 	if err := createDatabaseIfNotExists(databaseURL); err != nil {
-		return nil, NewInitializationError(fmt.Sprintf("failed to create database: %v", err))
+		return nil, fmt.Errorf("failed to create database: %v", err)
 	}
 
 	// Run migrations first
 	if err := runMigrations(databaseURL); err != nil {
-		return nil, NewInitializationError(fmt.Sprintf("failed to run migrations: %v", err))
+		return nil, fmt.Errorf("failed to run migrations: %v", err)
 	}
 
 	// Create pgx pool
 	pool, err := pgxpool.New(context.Background(), databaseURL)
 	if err != nil {
-		return nil, NewInitializationError(fmt.Sprintf("failed to create connection pool: %v", err))
+		return nil, fmt.Errorf("failed to create connection pool: %v", err)
 	}
 
 	// Test the connection
 	// FIXME: remove this
 	if err := pool.Ping(context.Background()); err != nil {
 		pool.Close()
-		return nil, NewInitializationError(fmt.Sprintf("failed to ping database: %v", err))
+		return nil, fmt.Errorf("failed to ping database: %v", err)
 	}
 
 	// Create a map of notification payloads to channels
@@ -163,7 +154,7 @@ func NewSystemDatabase() (SystemDatabase, error) {
 	// Create a connection to listen on notifications
 	config, err := pgconn.ParseConfig(databaseURL)
 	if err != nil {
-		return nil, NewInitializationError(fmt.Sprintf("failed to parse database URL: %v", err))
+		return nil, fmt.Errorf("failed to parse database URL: %v", err)
 	}
 	config.OnNotification = func(c *pgconn.PgConn, n *pgconn.Notification) {
 		if n.Channel == "dbos_notifications_channel" {
@@ -180,7 +171,7 @@ func NewSystemDatabase() (SystemDatabase, error) {
 	}
 	notificationListenerConnection, err := pgconn.ConnectConfig(context.Background(), config)
 	if err != nil {
-		return nil, NewInitializationError(fmt.Sprintf("failed to connect notification listener to database: %v", err))
+		return nil, fmt.Errorf("failed to connect notification listener to database: %v", err)
 	}
 
 	return &systemDatabase{
@@ -1330,7 +1321,7 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 				getLogger().Warn("Local pending workflows on queue exceeds worker concurrency limit", "local_pending", localPendingWorkflows, "queue_name", queue.Name, "concurrency_limit", workerConcurrency)
 			}
 			availableWorkerTasks := max(workerConcurrency-localPendingWorkflows, 0)
-			maxTasks = uint(availableWorkerTasks)
+			maxTasks = availableWorkerTasks
 		}
 
 		// Check global concurrency limit
@@ -1345,8 +1336,8 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 				getLogger().Warn("Total pending workflows on queue exceeds global concurrency limit", "total_pending", globalPendingWorkflows, "queue_name", queue.Name, "concurrency_limit", concurrency)
 			}
 			availableTasks := max(concurrency-globalPendingWorkflows, 0)
-			if uint(availableTasks) < maxTasks {
-				maxTasks = uint(availableTasks)
+			if availableTasks < maxTasks {
+				maxTasks = availableTasks
 			}
 		}
 	}
@@ -1383,8 +1374,7 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 			%s`, lockClause)
 	}
 
-	// Add limit if maxTasks is finite
-	if maxTasks > 0 {
+	if maxTasks >= 0 {
 		query += fmt.Sprintf(" LIMIT %d", int(maxTasks))
 	}
 

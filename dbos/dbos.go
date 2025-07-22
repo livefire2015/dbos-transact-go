@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"reflect"
 	"runtime"
@@ -78,12 +79,7 @@ func getExecutor() *executor {
 var logger *slog.Logger
 
 func getLogger() *slog.Logger {
-	if dbos == nil {
-		fmt.Println("warning: DBOS instance not initialized, using default logger")
-		return slog.New(slog.NewTextHandler(os.Stderr, nil))
-	}
-	if logger == nil {
-		fmt.Println("warning: DBOS logger is nil, using default logger")
+	if dbos == nil || logger == nil {
 		return slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	return logger
@@ -92,6 +88,40 @@ func getLogger() *slog.Logger {
 type config struct {
 	logger      *slog.Logger
 	adminServer bool
+	databaseURL string
+	appName     string
+}
+
+// NewConfig merges configuration from two sources in order of precedence:
+// 1. programmatic configuration
+// 2. environment variables
+// Finally, it applies default values if needed.
+func NewConfig(programmaticConfig config) *config {
+	dbosConfig := &config{}
+
+	// Start with environment variables (lowest precedence)
+	if dbURL := os.Getenv("DBOS_SYSTEM_DATABASE_URL"); dbURL != "" {
+		dbosConfig.databaseURL = dbURL
+	}
+
+	// Override with programmatic configuration (highest precedence)
+	if len(programmaticConfig.databaseURL) > 0 {
+		dbosConfig.databaseURL = programmaticConfig.databaseURL
+	}
+	if len(programmaticConfig.appName) > 0 {
+		dbosConfig.appName = programmaticConfig.appName
+	}
+	// Copy over parameters that can only be set programmatically
+	dbosConfig.logger = programmaticConfig.logger
+	dbosConfig.adminServer = programmaticConfig.adminServer
+
+	// Load defaults
+	if len(dbosConfig.databaseURL) == 0 {
+		getLogger().Info("Using default database URL: postgres://postgres:${PGPASSWORD}@localhost:5432/dbos?sslmode=disable")
+		password := url.QueryEscape(os.Getenv("PGPASSWORD"))
+		dbosConfig.databaseURL = fmt.Sprintf("postgres://postgres:%s@localhost:5432/dbos?sslmode=disable", password)
+	}
+	return dbosConfig
 }
 
 type LaunchOption func(*config)
@@ -108,18 +138,26 @@ func WithAdminServer() LaunchOption {
 	}
 }
 
+func WithDatabaseURL(url string) LaunchOption {
+	return func(config *config) {
+		config.databaseURL = url
+	}
+}
+
 func Launch(options ...LaunchOption) error {
 	if dbos != nil {
 		fmt.Println("warning: DBOS instance already initialized, skipping re-initialization")
 		return NewInitializationError("DBOS already initialized")
 	}
 
+	// Load & process the configuration
 	config := &config{
 		logger: slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	}
 	for _, option := range options {
 		option(config)
 	}
+	config = NewConfig(*config)
 
 	logger = config.logger
 
@@ -139,7 +177,7 @@ func Launch(options ...LaunchOption) error {
 	APP_ID = os.Getenv("DBOS__APPID")
 
 	// Create the system database
-	systemDB, err := NewSystemDatabase()
+	systemDB, err := NewSystemDatabase(config.databaseURL)
 	if err != nil {
 		return NewInitializationError(fmt.Sprintf("failed to create system database: %v", err))
 	}

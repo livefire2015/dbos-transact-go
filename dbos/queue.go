@@ -14,9 +14,13 @@ import (
 )
 
 var (
-	workflowQueueRegistry    = make(map[string]WorkflowQueue)
-	DBOS_INTERNAL_QUEUE_NAME = "_dbos_internal_queue"
-	_                        = NewWorkflowQueue(DBOS_INTERNAL_QUEUE_NAME)
+	workflowQueueRegistry = make(map[string]WorkflowQueue)
+	_                     = NewWorkflowQueue(_DBOS_INTERNAL_QUEUE_NAME)
+)
+
+const (
+	_DBOS_INTERNAL_QUEUE_NAME        = "_dbos_internal_queue"
+	_DEFAULT_MAX_TASKS_PER_ITERATION = 100
 )
 
 // RateLimiter represents a rate limiting configuration
@@ -31,7 +35,7 @@ type WorkflowQueue struct {
 	GlobalConcurrency    *int
 	PriorityEnabled      bool
 	Limiter              *RateLimiter
-	MaxTasksPerIteration uint
+	MaxTasksPerIteration int
 }
 
 // QueueOption is a functional option for configuring a workflow queue
@@ -61,7 +65,7 @@ func WithRateLimiter(limiter *RateLimiter) QueueOption {
 	}
 }
 
-func WithMaxTasksPerIteration(maxTasks uint) QueueOption {
+func WithMaxTasksPerIteration(maxTasks int) QueueOption {
 	return func(q *WorkflowQueue) {
 		q.MaxTasksPerIteration = maxTasks
 	}
@@ -84,7 +88,7 @@ func NewWorkflowQueue(name string, options ...QueueOption) WorkflowQueue {
 		GlobalConcurrency:    nil,
 		PriorityEnabled:      false,
 		Limiter:              nil,
-		MaxTasksPerIteration: 100, // Default max tasks per iteration
+		MaxTasksPerIteration: _DEFAULT_MAX_TASKS_PER_ITERATION,
 	}
 
 	// Apply functional options
@@ -111,9 +115,6 @@ func queueRunner(ctx context.Context) {
 
 	pollingInterval := baseInterval
 
-	// XXX doing this lets the dequeue and the task invokation survive the context cancellation
-	// We might be OK with not doing this. During the tests it results in all sorts of error inside the two functions above due to context cancellation
-	runnerContext := context.WithoutCancel(ctx)
 	for {
 		hasBackoffError := false
 
@@ -121,7 +122,7 @@ func queueRunner(ctx context.Context) {
 		for queueName, queue := range workflowQueueRegistry {
 			getLogger().Debug("Processing queue", "queue_name", queueName)
 			// Call DequeueWorkflows for each queue
-			dequeuedWorkflows, err := getExecutor().systemDB.DequeueWorkflows(runnerContext, queue)
+			dequeuedWorkflows, err := getExecutor().systemDB.DequeueWorkflows(ctx, queue)
 			if err != nil {
 				if pgErr, ok := err.(*pgconn.PgError); ok {
 					switch pgErr.Code {
@@ -164,7 +165,7 @@ func queueRunner(ctx context.Context) {
 					}
 				}
 
-				_, err := registeredWorkflow.wrappedFunction(runnerContext, input, WithWorkflowID(workflow.id))
+				_, err := registeredWorkflow.wrappedFunction(ctx, input, WithWorkflowID(workflow.id))
 				if err != nil {
 					getLogger().Error("Error recovering workflow", "error", err)
 				}
