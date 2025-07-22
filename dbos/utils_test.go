@@ -12,15 +12,23 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+func getDatabaseURL(t *testing.T) string {
+	databaseURL := os.Getenv("DBOS_SYSTEM_DATABASE_URL")
+	if databaseURL == "" {
+		if os.Getenv("PGPASSWORD") == "" {
+			t.Skip("PGPASSWORD not set, cannot construct database URL")
+		}
+		password := url.QueryEscape(os.Getenv("PGPASSWORD"))
+		databaseURL = fmt.Sprintf("postgres://postgres:%s@localhost:5432/dbos?sslmode=disable", password)
+	}
+	return databaseURL
+}
+
 /* Test database setup */
 func setupDBOS(t *testing.T) {
 	t.Helper()
 
-	databaseURL := os.Getenv("DBOS_SYSTEM_DATABASE_URL")
-	if databaseURL == "" {
-		password := url.QueryEscape(os.Getenv("PGPASSWORD"))
-		databaseURL = fmt.Sprintf("postgres://postgres:%s@localhost:5432/dbos?sslmode=disable", password)
-	}
+	databaseURL := getDatabaseURL(t)
 
 	// Clean up the test database
 	parsedURL, err := pgx.ParseConfig(databaseURL)
@@ -46,9 +54,17 @@ func setupDBOS(t *testing.T) {
 		t.Fatalf("failed to drop test database: %v", err)
 	}
 
-	err = Launch()
+	err = Initialize(Config{
+		DatabaseURL: databaseURL,
+		AppName:     "test-app",
+	})
 	if err != nil {
 		t.Fatalf("failed to create DBOS instance: %v", err)
+	}
+
+	err = Launch()
+	if err != nil {
+		t.Fatalf("failed to launch DBOS instance: %v", err)
 	}
 
 	if dbos == nil {
@@ -115,7 +131,7 @@ func restartQueueRunner() {
 		dbos.queueRunnerCtx = ctx
 		dbos.queueRunnerCancelFunc = cancel
 		dbos.queueRunnerDone = make(chan struct{})
-		
+
 		// Start the queue runner in a goroutine
 		go func() {
 			defer close(dbos.queueRunnerDone)
@@ -141,7 +157,7 @@ func queueEntriesAreCleanedUp() bool {
 	success := false
 	for range maxTries {
 		// Begin transaction
-		tx, err := getExecutor().systemDB.(*systemDatabase).pool.Begin(context.Background())
+		tx, err := dbos.systemDB.(*systemDatabase).pool.Begin(context.Background())
 		if err != nil {
 			return false
 		}
