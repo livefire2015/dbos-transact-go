@@ -5,6 +5,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -98,7 +99,8 @@ func createDatabaseIfNotExists(databaseURL string) error {
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-// TODO: must use the systemdb name
+const _DBOS_MIGRATION_TABLE = "dbos_schema_migrations"
+
 func runMigrations(databaseURL string) error {
 	// Change the driver to pgx5
 	databaseURL = "pgx5://" + strings.TrimPrefix(databaseURL, "postgres://")
@@ -108,6 +110,20 @@ func runMigrations(databaseURL string) error {
 	if err != nil {
 		return newInitializationError(fmt.Sprintf("failed to create migration source: %v", err))
 	}
+
+	// Add custom migration table name to avoid conflicts with user migrations
+	// Parse the URL to properly determine where to add the query parameter
+	parsedURL, err := url.Parse(databaseURL)
+	if err != nil {
+		return newInitializationError(fmt.Sprintf("failed to parse database URL: %v", err))
+	}
+
+	// Check if query parameters already exist
+	separator := "?"
+	if parsedURL.RawQuery != "" {
+		separator = "&"
+	}
+	databaseURL += separator + "x-migrations-table=" + _DBOS_MIGRATION_TABLE
 
 	// Create migrator
 	m, err := migrate.NewWithSourceInstance("iofs", d, databaseURL)
@@ -646,12 +662,12 @@ func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID str
 }
 
 type recordOperationResultDBInput struct {
-	workflowID    string
-	operationID   int
-	operationName string
-	output        any
-	err           error
-	tx            pgx.Tx
+	workflowID string
+	stepID     int
+	stepName   string
+	output     any
+	err        error
+	tx         pgx.Tx
 }
 
 func (s *systemDatabase) RecordOperationResult(ctx context.Context, input recordOperationResultDBInput) error {
@@ -675,18 +691,18 @@ func (s *systemDatabase) RecordOperationResult(ctx context.Context, input record
 	if input.tx != nil {
 		commandTag, err = input.tx.Exec(ctx, query,
 			input.workflowID,
-			input.operationID,
+			input.stepID,
 			outputString,
 			errorString,
-			input.operationName,
+			input.stepName,
 		)
 	} else {
 		commandTag, err = s.pool.Exec(ctx, query,
 			input.workflowID,
-			input.operationID,
+			input.stepID,
 			outputString,
 			errorString,
-			input.operationName,
+			input.stepName,
 		)
 	}
 
@@ -716,8 +732,8 @@ func (s *systemDatabase) RecordOperationResult(ctx context.Context, input record
 type recordChildWorkflowDBInput struct {
 	parentWorkflowID string
 	childWorkflowID  string
-	functionID       int
-	functionName     string
+	stepID           int
+	stepName         string
 	tx               pgx.Tx
 }
 
@@ -732,15 +748,15 @@ func (s *systemDatabase) RecordChildWorkflow(ctx context.Context, input recordCh
 	if input.tx != nil {
 		commandTag, err = input.tx.Exec(ctx, query,
 			input.parentWorkflowID,
-			input.functionID,
-			input.functionName,
+			input.stepID,
+			input.stepName,
 			input.childWorkflowID,
 		)
 	} else {
 		commandTag, err = s.pool.Exec(ctx, query,
 			input.parentWorkflowID,
-			input.functionID,
-			input.functionName,
+			input.stepID,
+			input.stepName,
 			input.childWorkflowID,
 		)
 	}
@@ -750,7 +766,7 @@ func (s *systemDatabase) RecordChildWorkflow(ctx context.Context, input recordCh
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
 			return fmt.Errorf(
 				"child workflow %s already registered for parent workflow %s (operation ID: %d)",
-				input.childWorkflowID, input.parentWorkflowID, input.functionID)
+				input.childWorkflowID, input.parentWorkflowID, input.stepID)
 		}
 		return fmt.Errorf("failed to record child workflow: %w", err)
 	}
@@ -782,7 +798,7 @@ func (s *systemDatabase) CheckChildWorkflow(ctx context.Context, workflowID stri
 type recordChildGetResultDBInput struct {
 	parentWorkflowID string
 	childWorkflowID  string
-	operationID      int
+	stepID           int
 	output           string
 	err              error
 }
@@ -801,7 +817,7 @@ func (s *systemDatabase) RecordChildGetResult(ctx context.Context, input recordC
 
 	_, err := s.pool.Exec(ctx, query,
 		input.parentWorkflowID,
-		input.operationID,
+		input.stepID,
 		"DBOS.getResult",
 		input.output,
 		errorString,
@@ -823,10 +839,10 @@ type recordedResult struct {
 }
 
 type checkOperationExecutionDBInput struct {
-	workflowID   string
-	operationID  int
-	functionName string
-	tx           pgx.Tx
+	workflowID string
+	stepID     int
+	stepName   string
+	tx         pgx.Tx
 }
 
 func (s *systemDatabase) CheckOperationExecution(ctx context.Context, input checkOperationExecutionDBInput) (*recordedResult, error) {
@@ -848,7 +864,7 @@ func (s *systemDatabase) CheckOperationExecution(ctx context.Context, input chec
 	workflowStatusQuery := `SELECT status FROM dbos.workflow_status WHERE workflow_uuid = $1`
 
 	// Second query: Retrieve operation outputs if they exist
-	operationOutputQuery := `SELECT output, error, function_name
+	stepOutputQuery := `SELECT output, error, function_name
 							 FROM dbos.operation_outputs
 							 WHERE workflow_uuid = $1 AND function_id = $2`
 
@@ -873,7 +889,7 @@ func (s *systemDatabase) CheckOperationExecution(ctx context.Context, input chec
 	var errorStr *string
 	var recordedFunctionName string
 
-	err = tx.QueryRow(ctx, operationOutputQuery, input.workflowID, input.operationID).Scan(&outputString, &errorStr, &recordedFunctionName)
+	err = tx.QueryRow(ctx, stepOutputQuery, input.workflowID, input.stepID).Scan(&outputString, &errorStr, &recordedFunctionName)
 
 	// If there are no operation outputs, return nil
 	if err != nil {
@@ -884,8 +900,8 @@ func (s *systemDatabase) CheckOperationExecution(ctx context.Context, input chec
 	}
 
 	// If the provided and recorded function name are different, throw an exception
-	if input.functionName != recordedFunctionName {
-		return nil, newUnexpectedStepError(input.workflowID, input.operationID, input.functionName, recordedFunctionName)
+	if input.stepName != recordedFunctionName {
+		return nil, newUnexpectedStepError(input.workflowID, input.stepID, input.stepName, recordedFunctionName)
 	}
 
 	output, err := deserialize(outputString)
@@ -1009,16 +1025,16 @@ func (s *systemDatabase) Send(ctx context.Context, input WorkflowSendInput) erro
 	functionName := "DBOS.send"
 
 	// Get workflow state from context
-	workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
-	if !ok || workflowState == nil {
+	wfState, ok := ctx.Value(workflowStateKey).(*workflowState)
+	if !ok || wfState == nil {
 		return newStepExecutionError("", functionName, "workflow state not found in context: are you running this step within a workflow?")
 	}
 
-	if workflowState.isWithinStep {
-		return newStepExecutionError(workflowState.WorkflowID, functionName, "cannot call Send within a step")
+	if wfState.isWithinStep {
+		return newStepExecutionError(wfState.workflowID, functionName, "cannot call Send within a step")
 	}
 
-	stepID := workflowState.NextStepID()
+	stepID := wfState.NextStepID()
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1028,10 +1044,10 @@ func (s *systemDatabase) Send(ctx context.Context, input WorkflowSendInput) erro
 
 	// Check if operation was already executed and do nothing if so
 	checkInput := checkOperationExecutionDBInput{
-		workflowID:   workflowState.WorkflowID,
-		operationID:  stepID,
-		functionName: functionName,
-		tx:           tx,
+		workflowID: wfState.workflowID,
+		stepID:     stepID,
+		stepName:   functionName,
+		tx:         tx,
 	}
 	recordedResult, err := s.CheckOperationExecution(ctx, checkInput)
 	if err != nil {
@@ -1068,12 +1084,12 @@ func (s *systemDatabase) Send(ctx context.Context, input WorkflowSendInput) erro
 
 	// Record the operation result
 	recordInput := recordOperationResultDBInput{
-		workflowID:    workflowState.WorkflowID,
-		operationID:   stepID,
-		operationName: functionName,
-		output:        nil,
-		err:           nil,
-		tx:            tx,
+		workflowID: wfState.workflowID,
+		stepID:     stepID,
+		stepName:   functionName,
+		output:     nil,
+		err:        nil,
+		tx:         tx,
 	}
 
 	err = s.RecordOperationResult(ctx, recordInput)
@@ -1095,17 +1111,17 @@ func (s *systemDatabase) Recv(ctx context.Context, input WorkflowRecvInput) (any
 
 	// Get workflow state from context
 	// XXX these checks might be better suited for outside of the system db code. We'll see when we implement the client.
-	workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
-	if !ok || workflowState == nil {
+	wfState, ok := ctx.Value(workflowStateKey).(*workflowState)
+	if !ok || wfState == nil {
 		return nil, newStepExecutionError("", functionName, "workflow state not found in context: are you running this step within a workflow?")
 	}
 
-	if workflowState.isWithinStep {
-		return nil, newStepExecutionError(workflowState.WorkflowID, functionName, "cannot call Recv within a step")
+	if wfState.isWithinStep {
+		return nil, newStepExecutionError(wfState.workflowID, functionName, "cannot call Recv within a step")
 	}
 
-	stepID := workflowState.NextStepID()
-	destinationID := workflowState.WorkflowID
+	stepID := wfState.NextStepID()
+	destinationID := wfState.workflowID
 
 	// Set default topic if not provided
 	topic := _DBOS_NULL_TOPIC
@@ -1116,9 +1132,9 @@ func (s *systemDatabase) Recv(ctx context.Context, input WorkflowRecvInput) (any
 	// Check if operation was already executed
 	// XXX this might not need to be in the transaction
 	checkInput := checkOperationExecutionDBInput{
-		workflowID:   destinationID,
-		operationID:  stepID,
-		functionName: functionName,
+		workflowID: destinationID,
+		stepID:     stepID,
+		stepName:   functionName,
 	}
 	recordedResult, err := s.CheckOperationExecution(ctx, checkInput)
 	if err != nil {
@@ -1217,11 +1233,11 @@ func (s *systemDatabase) Recv(ctx context.Context, input WorkflowRecvInput) (any
 
 	// Record the operation result
 	recordInput := recordOperationResultDBInput{
-		workflowID:    destinationID,
-		operationID:   stepID,
-		operationName: functionName,
-		output:        message,
-		tx:            tx,
+		workflowID: destinationID,
+		stepID:     stepID,
+		stepName:   functionName,
+		output:     message,
+		tx:         tx,
 	}
 	err = s.RecordOperationResult(ctx, recordInput)
 	if err != nil {
@@ -1239,16 +1255,16 @@ func (s *systemDatabase) SetEvent(ctx context.Context, input WorkflowSetEventInp
 	functionName := "DBOS.setEvent"
 
 	// Get workflow state from context
-	workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
-	if !ok || workflowState == nil {
+	wfState, ok := ctx.Value(workflowStateKey).(*workflowState)
+	if !ok || wfState == nil {
 		return newStepExecutionError("", functionName, "workflow state not found in context: are you running this step within a workflow?")
 	}
 
-	if workflowState.isWithinStep {
-		return newStepExecutionError(workflowState.WorkflowID, functionName, "cannot call SetEvent within a step")
+	if wfState.isWithinStep {
+		return newStepExecutionError(wfState.workflowID, functionName, "cannot call SetEvent within a step")
 	}
 
-	stepID := workflowState.NextStepID()
+	stepID := wfState.NextStepID()
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1258,10 +1274,10 @@ func (s *systemDatabase) SetEvent(ctx context.Context, input WorkflowSetEventInp
 
 	// Check if operation was already executed and do nothing if so
 	checkInput := checkOperationExecutionDBInput{
-		workflowID:   workflowState.WorkflowID,
-		operationID:  stepID,
-		functionName: functionName,
-		tx:           tx,
+		workflowID: wfState.workflowID,
+		stepID:     stepID,
+		stepName:   functionName,
+		tx:         tx,
 	}
 	recordedResult, err := s.CheckOperationExecution(ctx, checkInput)
 	if err != nil {
@@ -1284,19 +1300,19 @@ func (s *systemDatabase) SetEvent(ctx context.Context, input WorkflowSetEventInp
 					ON CONFLICT (workflow_uuid, key)
 					DO UPDATE SET value = EXCLUDED.value`
 
-	_, err = tx.Exec(ctx, insertQuery, workflowState.WorkflowID, input.Key, messageString)
+	_, err = tx.Exec(ctx, insertQuery, wfState.workflowID, input.Key, messageString)
 	if err != nil {
 		return fmt.Errorf("failed to insert/update workflow event: %w", err)
 	}
 
 	// Record the operation result
 	recordInput := recordOperationResultDBInput{
-		workflowID:    workflowState.WorkflowID,
-		operationID:   stepID,
-		operationName: functionName,
-		output:        nil,
-		err:           nil,
-		tx:            tx,
+		workflowID: wfState.workflowID,
+		stepID:     stepID,
+		stepName:   functionName,
+		output:     nil,
+		err:        nil,
+		tx:         tx,
 	}
 
 	err = s.RecordOperationResult(ctx, recordInput)
@@ -1316,22 +1332,22 @@ func (s *systemDatabase) GetEvent(ctx context.Context, input WorkflowGetEventInp
 	functionName := "DBOS.getEvent"
 
 	// Get workflow state from context (optional for GetEvent as we can get an event from outside a workflow)
-	workflowState, ok := ctx.Value(WorkflowStateKey).(*WorkflowState)
+	wfState, ok := ctx.Value(workflowStateKey).(*workflowState)
 	var stepID int
 	var isInWorkflow bool
 
-	if ok && workflowState != nil {
+	if ok && wfState != nil {
 		isInWorkflow = true
-		if workflowState.isWithinStep {
-			return nil, newStepExecutionError(workflowState.WorkflowID, functionName, "cannot call GetEvent within a step")
+		if wfState.isWithinStep {
+			return nil, newStepExecutionError(wfState.workflowID, functionName, "cannot call GetEvent within a step")
 		}
-		stepID = workflowState.NextStepID()
+		stepID = wfState.NextStepID()
 
 		// Check if operation was already executed (only if in workflow)
 		checkInput := checkOperationExecutionDBInput{
-			workflowID:   workflowState.WorkflowID,
-			operationID:  stepID,
-			functionName: functionName,
+			workflowID: wfState.workflowID,
+			stepID:     stepID,
+			stepName:   functionName,
 		}
 		recordedResult, err := s.CheckOperationExecution(ctx, checkInput)
 		if err != nil {
@@ -1414,11 +1430,11 @@ func (s *systemDatabase) GetEvent(ctx context.Context, input WorkflowGetEventInp
 	// Record the operation result if this is called within a workflow
 	if isInWorkflow {
 		recordInput := recordOperationResultDBInput{
-			workflowID:    workflowState.WorkflowID,
-			operationID:   stepID,
-			operationName: functionName,
-			output:        value,
-			err:           nil,
+			workflowID: wfState.workflowID,
+			stepID:     stepID,
+			stepName:   functionName,
+			output:     value,
+			err:        nil,
 		}
 
 		err = s.RecordOperationResult(ctx, recordInput)
