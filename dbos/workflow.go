@@ -114,8 +114,8 @@ func (h *workflowHandle[R]) GetResult(ctx context.Context) (R, error) {
 		}
 		recordResultErr := dbos.systemDB.RecordChildGetResult(ctx, recordGetResultInput)
 		if recordResultErr != nil {
-			// XXX do we want to fail this?
 			getLogger().Error("failed to record get result", "error", recordResultErr)
+			return *new(R), newWorkflowExecutionError(parentWorkflowState.workflowID, fmt.Sprintf("recording child workflow result: %v", recordResultErr))
 		}
 	}
 	return outcome.result, outcome.err
@@ -307,6 +307,7 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R], opts ...workflowRegistrat
 		if err != nil {
 			panic(fmt.Sprintf("failed to register scheduled workflow: %v", err))
 		}
+		getLogger().Info("Registered scheduled workflow", "fqn", fqn, "cron_schedule", registrationParams.cronSchedule)
 	}
 
 	// Register a type-erased version of the durable workflow for recovery
@@ -333,7 +334,6 @@ func WithWorkflow[P any, R any](fn WorkflowFunc[P, R], opts ...workflowRegistrat
 
 type contextKey string
 
-// TODO this should be a private type, once we have proper getter for a workflow state
 const workflowStateKey contextKey = "workflowState"
 
 type WorkflowFunc[P any, R any] func(ctx context.Context, input P) (R, error)
@@ -389,7 +389,7 @@ func WithWorkflowMaxRetries(maxRetries int) workflowOption {
 func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], input P, opts ...workflowOption) (WorkflowHandle[R], error) {
 	// Apply options to build params
 	params := workflowParams{
-		applicationVersion: _APP_VERSION,
+		applicationVersion: dbos.applicationVersion,
 	}
 	for _, opt := range opts {
 		opt(&params)
@@ -438,14 +438,14 @@ func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], inp
 	workflowStatus := WorkflowStatus{
 		Name:               runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(), // TODO factor out somewhere else so we dont' have to reflect here
 		ApplicationVersion: params.applicationVersion,
-		ExecutorID:         _EXECUTOR_ID,
+		ExecutorID:         dbos.executorID,
 		Status:             status,
 		ID:                 workflowID,
 		CreatedAt:          time.Now(),
 		Deadline:           params.deadline, // TODO compute the deadline based on the timeout
 		Timeout:            params.timeout,
 		Input:              input,
-		ApplicationID:      _APP_ID,
+		ApplicationID:      dbos.applicationID,
 		QueueName:          params.queueName,
 	}
 
@@ -517,7 +517,9 @@ func runAsWorkflow[P any, R any](ctx context.Context, fn WorkflowFunc[P, R], inp
 
 	// Run the function in a goroutine
 	augmentUserContext := context.WithValue(ctx, workflowStateKey, wfState)
+	dbos.workflowsWg.Add(1)
 	go func() {
+		defer dbos.workflowsWg.Done()
 		result, err := fn(augmentUserContext, input)
 		status := WorkflowStatusSuccess
 		if err != nil {
@@ -631,7 +633,7 @@ func RunAsStep[P any, R any](ctx context.Context, fn StepFunc[P, R], input P, op
 	recordedOutput, err := dbos.systemDB.CheckOperationExecution(ctx, checkOperationExecutionDBInput{
 		workflowID: wfState.workflowID,
 		stepID:     stepID,
-		stepName:   runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name(),
+		stepName:   stepName,
 	})
 	if err != nil {
 		return *new(R), newStepExecutionError(wfState.workflowID, stepName, fmt.Sprintf("checking operation execution: %v", err))
