@@ -58,7 +58,7 @@ type DBOSContext interface {
 
 	// Context Lifecycle
 	Launch() error
-	Shutdown()
+	Cancel()
 
 	// Workflow operations
 	RunAsStep(_ DBOSContext, fn StepFunc, input any) (any, error)
@@ -128,9 +128,6 @@ func (c *dbosContext) Value(key any) any {
 	return c.ctx.Value(key)
 }
 
-// Create a new context
-// This is intended for workflow contexts and step contexts
-// Hence we only set the relevant fields
 func WithValue(ctx DBOSContext, key, val any) DBOSContext {
 	if ctx == nil {
 		return nil
@@ -138,7 +135,7 @@ func WithValue(ctx DBOSContext, key, val any) DBOSContext {
 	// Will do nothing if the concrete type is not dbosContext
 	if dbosCtx, ok := ctx.(*dbosContext); ok {
 		return &dbosContext{
-			ctx:                context.WithValue(dbosCtx.ctx, key, val),
+			ctx:                context.WithValue(dbosCtx.ctx, key, val), // Spawn a new child context with the value set
 			logger:             dbosCtx.logger,
 			systemDB:           dbosCtx.systemDB,
 			workflowsWg:        dbosCtx.workflowsWg,
@@ -150,6 +147,47 @@ func WithValue(ctx DBOSContext, key, val any) DBOSContext {
 		}
 	}
 	return nil
+}
+
+func WithoutCancel(ctx DBOSContext) DBOSContext {
+	if ctx == nil {
+		return nil
+	}
+	if dbosCtx, ok := ctx.(*dbosContext); ok {
+		return &dbosContext{
+			ctx:                context.WithoutCancel(dbosCtx.ctx),
+			logger:             dbosCtx.logger,
+			systemDB:           dbosCtx.systemDB,
+			workflowsWg:        dbosCtx.workflowsWg,
+			workflowRegistry:   dbosCtx.workflowRegistry,
+			workflowRegMutex:   dbosCtx.workflowRegMutex,
+			applicationVersion: dbosCtx.applicationVersion,
+			executorID:         dbosCtx.executorID,
+			applicationID:      dbosCtx.applicationID,
+		}
+	}
+	return nil
+}
+
+func WithTimeout(ctx DBOSContext, timeout time.Duration) (DBOSContext, context.CancelFunc) {
+	if ctx == nil {
+		return nil, func() {}
+	}
+	if dbosCtx, ok := ctx.(*dbosContext); ok {
+		newCtx, cancelFunc := context.WithTimeoutCause(dbosCtx.ctx, timeout, errors.New("DBOS context timeout"))
+		return &dbosContext{
+			ctx:                newCtx,
+			logger:             dbosCtx.logger,
+			systemDB:           dbosCtx.systemDB,
+			workflowsWg:        dbosCtx.workflowsWg,
+			workflowRegistry:   dbosCtx.workflowRegistry,
+			workflowRegMutex:   dbosCtx.workflowRegMutex,
+			applicationVersion: dbosCtx.applicationVersion,
+			executorID:         dbosCtx.executorID,
+			applicationID:      dbosCtx.applicationID,
+		}, cancelFunc
+	}
+	return nil, func() {}
 }
 
 func (c *dbosContext) getWorkflowScheduler() *cron.Cron {
@@ -277,8 +315,8 @@ func (c *dbosContext) Launch() error {
 	return nil
 }
 
-// We might consider renaming this to "Cancel" to me more idiomatic
-func (c *dbosContext) Shutdown() {
+// TODO: shutdown should really have a timeout and return an error if it wasn't able to shutdown everything
+func (c *dbosContext) Cancel() {
 	c.logger.Info("Shutting down DBOS context")
 
 	// Cancel the context to signal all resources to stop

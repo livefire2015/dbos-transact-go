@@ -72,7 +72,7 @@ func setupDBOS(t *testing.T, dropDB bool, checkLeaks bool) DBOSContext {
 	t.Cleanup(func() {
 		dbosCtx.(*dbosContext).logger.Info("Cleaning up DBOS instance...")
 		if dbosCtx != nil {
-			dbosCtx.Shutdown()
+			dbosCtx.Cancel()
 		}
 		dbosCtx = nil
 		if checkLeaks {
@@ -137,7 +137,7 @@ func queueEntriesAreCleanedUp(ctx DBOSContext) bool {
 	for range maxTries {
 		// Begin transaction
 		exec := ctx.(*dbosContext)
-		tx, err := exec.systemDB.(*systemDatabase).pool.Begin(context.Background())
+		tx, err := exec.systemDB.(*systemDatabase).pool.Begin(ctx)
 		if err != nil {
 			return false
 		}
@@ -149,8 +149,8 @@ func queueEntriesAreCleanedUp(ctx DBOSContext) bool {
 					AND status IN ('ENQUEUED', 'PENDING')`
 
 		var count int
-		err = tx.QueryRow(context.Background(), query, _DBOS_INTERNAL_QUEUE_NAME).Scan(&count)
-		tx.Rollback(context.Background()) // Clean up transaction
+		err = tx.QueryRow(ctx, query, _DBOS_INTERNAL_QUEUE_NAME).Scan(&count)
+		tx.Rollback(ctx) // Clean up transaction
 
 		if err != nil {
 			return false

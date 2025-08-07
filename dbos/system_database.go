@@ -34,6 +34,7 @@ type SystemDatabase interface {
 	ListWorkflows(ctx context.Context, input listWorkflowsDBInput) ([]WorkflowStatus, error)
 	UpdateWorkflowOutcome(ctx context.Context, input updateWorkflowOutcomeDBInput) error
 	AwaitWorkflowResult(ctx context.Context, workflowID string) (any, error)
+	CancelWorkflow(ctx context.Context, workflowID string) error
 
 	// Child workflows
 	RecordChildWorkflow(ctx context.Context, input recordChildWorkflowDBInput) error
@@ -249,11 +250,12 @@ func (s *systemDatabase) Shutdown(ctx context.Context) {
 /*******************************/
 
 type insertWorkflowResult struct {
-	attempts                int
-	status                  WorkflowStatusType
-	name                    string
-	queueName               *string
-	workflowDeadlineEpochMs *int64
+	attempts         int
+	status           WorkflowStatusType
+	name             string
+	queueName        *string
+	timeout          time.Duration
+	workflowDeadline time.Time
 }
 
 type insertWorkflowStatusDBInput struct {
@@ -284,9 +286,10 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input insertW
 		deadline = &millis
 	}
 
-	var timeoutMs int64 = 0
+	var timeoutMs *int64 = nil
 	if input.status.Timeout > 0 {
-		timeoutMs = input.status.Timeout.Milliseconds()
+		millis := input.status.Timeout.Milliseconds()
+		timeoutMs = &millis
 	}
 
 	inputString, err := serialize(input.status.Input)
@@ -325,9 +328,11 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input insertW
                 WHEN EXCLUDED.status = $20 THEN workflow_status.executor_id
                 ELSE EXCLUDED.executor_id
             END
-        RETURNING recovery_attempts, status, name, queue_name, workflow_deadline_epoch_ms`
+        RETURNING recovery_attempts, status, name, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms`
 
 	var result insertWorkflowResult
+	var timeoutMSResult *int64
+	var workflowDeadlineEpochMS *int64
 	err = input.tx.QueryRow(ctx, query,
 		input.status.ID,
 		input.status.Status,
@@ -354,10 +359,21 @@ func (s *systemDatabase) InsertWorkflowStatus(ctx context.Context, input insertW
 		&result.status,
 		&result.name,
 		&result.queueName,
-		&result.workflowDeadlineEpochMs,
+		&timeoutMSResult,
+		&workflowDeadlineEpochMS,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert workflow status: %w", err)
+	}
+
+	// Convert timeout milliseconds to time.Duration
+	if timeoutMSResult != nil && *timeoutMSResult > 0 {
+		result.timeout = time.Duration(*timeoutMSResult) * time.Millisecond
+	}
+
+	// Convert deadline milliseconds to time.Time
+	if workflowDeadlineEpochMS != nil {
+		result.workflowDeadline = time.Unix(0, *workflowDeadlineEpochMS*int64(time.Millisecond))
 	}
 
 	if len(input.status.Name) > 0 && result.name != input.status.Name {
@@ -613,7 +629,7 @@ func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) 
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx) // Rollback if not committed
+	defer tx.Rollback(ctx)
 
 	// Check if workflow exists
 	listInput := listWorkflowsDBInput{
@@ -630,7 +646,7 @@ func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) 
 
 	wf := wfs[0]
 	switch wf.Status {
-	case "SUCCESS", "ERROR", "CANCELLED":
+	case WorkflowStatusSuccess, WorkflowStatusError, WorkflowStatusCancelled:
 		// Workflow is already in a terminal state, rollback and return
 		if err := tx.Rollback(ctx); err != nil {
 			return fmt.Errorf("failed to commit transaction: %w", err)
@@ -638,12 +654,12 @@ func (s *systemDatabase) CancelWorkflow(ctx context.Context, workflowID string) 
 		return nil
 	}
 
-	//Set the workflow's status to CANCELLED
+	// Set the workflow's status to CANCELLED and started_at_epoch_ms to NULL (so it does not block the queue, if any)
 	updateStatusQuery := `UPDATE dbos.workflow_status
-						  SET status = 'CANCELLED', updated_at = $1
-						  WHERE workflow_uuid = $2`
+						  SET status = $1, updated_at = $2, started_at_epoch_ms = NULL
+						  WHERE workflow_uuid = $3`
 
-	_, err = tx.Exec(ctx, updateStatusQuery, time.Now().UnixMilli(), workflowID)
+	_, err = tx.Exec(ctx, updateStatusQuery, WorkflowStatusCancelled, time.Now().UnixMilli(), workflowID)
 	if err != nil {
 		return fmt.Errorf("failed to update workflow status to CANCELLED: %w", err)
 	}
@@ -677,19 +693,20 @@ func (s *systemDatabase) AwaitWorkflowResult(ctx context.Context, workflowID str
 			return nil, fmt.Errorf("failed to query workflow status: %w", err)
 		}
 
+		// Deserialize output from TEXT to bytes then from bytes to R using gob
+		output, err := deserialize(outputString)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize output: %w", err)
+		}
+
 		switch status {
 		case WorkflowStatusSuccess, WorkflowStatusError:
-			// Deserialize output from TEXT to bytes then from bytes to R using gob
-			output, err := deserialize(outputString)
-			if err != nil {
-				return nil, fmt.Errorf("failed to deserialize output: %w", err)
-			}
 			if errorStr == nil || len(*errorStr) == 0 {
 				return output, nil
 			}
 			return output, errors.New(*errorStr)
 		case WorkflowStatusCancelled:
-			return nil, newAwaitedWorkflowCancelledError(workflowID)
+			return output, newAwaitedWorkflowCancelledError(workflowID)
 		default:
 			time.Sleep(1 * time.Second)
 		}
@@ -1763,7 +1780,7 @@ func (s *systemDatabase) DequeueWorkflows(ctx context.Context, queue WorkflowQue
 	}
 
 	if len(dequeuedIDs) > 0 {
-		// fmt.Printf("[%s] attempting to dequeue %d task(s)\n", queue.Name, len(dequeuedIDs))
+		s.logger.Debug("attempting to dequeue task(s)", "queueName", queue.Name, "numTasks", len(dequeuedIDs))
 	}
 
 	// Update workflows to PENDING status and get their details
