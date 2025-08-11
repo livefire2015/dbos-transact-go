@@ -70,6 +70,7 @@ func setupDBOS(t *testing.T, dropDB bool, checkLeaks bool) DBOSContext {
 
 	// Register cleanup to run after test completes
 	t.Cleanup(func() {
+		fmt.Println("Cleaning up DBOS instance...")
 		dbosCtx.(*dbosContext).logger.Info("Cleaning up DBOS instance...")
 		if dbosCtx != nil {
 			dbosCtx.Cancel()
@@ -137,7 +138,7 @@ func queueEntriesAreCleanedUp(ctx DBOSContext) bool {
 	for range maxTries {
 		// Begin transaction
 		exec := ctx.(*dbosContext)
-		tx, err := exec.systemDB.(*systemDatabase).pool.Begin(ctx)
+		tx, err := exec.systemDB.(*sysDB).pool.Begin(ctx)
 		if err != nil {
 			return false
 		}
