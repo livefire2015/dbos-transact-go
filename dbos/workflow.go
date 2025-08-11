@@ -8,6 +8,7 @@ import (
 	"math"
 	"reflect"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -204,10 +205,11 @@ type WrappedWorkflowFunc func(ctx DBOSContext, input any, opts ...WorkflowOption
 type workflowRegistryEntry struct {
 	wrappedFunction WrappedWorkflowFunc
 	maxRetries      int
+	name            string
 }
 
 // Register adds a workflow function to the registry (thread-safe, only once per name)
-func registerWorkflow(ctx DBOSContext, workflowName string, fn WrappedWorkflowFunc, maxRetries int) {
+func registerWorkflow(ctx DBOSContext, workflowFQN string, fn WrappedWorkflowFunc, maxRetries int, customName string) {
 	// Skip if we don't have a concrete dbosContext
 	c, ok := ctx.(*dbosContext)
 	if !ok {
@@ -221,14 +223,15 @@ func registerWorkflow(ctx DBOSContext, workflowName string, fn WrappedWorkflowFu
 	c.workflowRegMutex.Lock()
 	defer c.workflowRegMutex.Unlock()
 
-	if _, exists := c.workflowRegistry[workflowName]; exists {
-		c.logger.Error("workflow function already registered", "fqn", workflowName)
-		panic(newConflictingRegistrationError(workflowName))
+	if _, exists := c.workflowRegistry[workflowFQN]; exists {
+		c.logger.Error("workflow function already registered", "fqn", workflowFQN)
+		panic(newConflictingRegistrationError(workflowFQN))
 	}
 
-	c.workflowRegistry[workflowName] = workflowRegistryEntry{
+	c.workflowRegistry[workflowFQN] = workflowRegistryEntry{
 		wrappedFunction: fn,
 		maxRetries:      maxRetries,
+		name:            customName,
 	}
 }
 
@@ -274,6 +277,7 @@ func registerScheduledWorkflow(ctx DBOSContext, workflowName string, fn Workflow
 type workflowRegistrationParams struct {
 	cronSchedule string
 	maxRetries   int
+	name         string
 }
 
 type workflowRegistrationOption func(*workflowRegistrationParams)
@@ -291,6 +295,12 @@ func WithMaxRetries(maxRetries int) workflowRegistrationOption {
 func WithSchedule(schedule string) workflowRegistrationOption {
 	return func(p *workflowRegistrationParams) {
 		p.cronSchedule = schedule
+	}
+}
+
+func WithWorkflowName(name string) workflowRegistrationOption {
+	return func(p *workflowRegistrationParams) {
+		p.name = name
 	}
 }
 
@@ -347,7 +357,7 @@ func RegisterWorkflow[P any, R any](ctx DBOSContext, fn GenericWorkflowFunc[P, R
 		}
 		return &workflowPollingHandle[any]{workflowID: handle.GetWorkflowID(), dbosContext: ctx}, nil // this is only used by recovery and queue runner so far -- queue runner dismisses it
 	})
-	registerWorkflow(ctx, fqn, typeErasedWrapper, registrationParams.maxRetries)
+	registerWorkflow(ctx, fqn, typeErasedWrapper, registrationParams.maxRetries, registrationParams.name)
 
 	// If this is a scheduled workflow, register a cron job
 	if registrationParams.cronSchedule != "" {
@@ -397,6 +407,7 @@ func WithApplicationVersion(version string) WorkflowOption {
 	}
 }
 
+// An internal option we use to map the reflection function name to the registration options.
 func withWorkflowName(name string) WorkflowOption {
 	return func(p *workflowParams) {
 		p.workflowName = name
@@ -483,6 +494,9 @@ func (c *dbosContext) RunAsWorkflow(_ DBOSContext, fn WorkflowFunc, input any, o
 	}
 	if registeredWorkflow.maxRetries > 0 {
 		params.maxRetries = registeredWorkflow.maxRetries
+	}
+	if len(registeredWorkflow.name) > 0 {
+		params.workflowName = registeredWorkflow.name
 	}
 
 	// Check if we are within a workflow (and thus a child workflow)
@@ -705,7 +719,12 @@ func setStepParamDefaults(params *StepParams, stepName string) *StepParams {
 			BackoffFactor: 2.0,
 			BaseInterval:  100 * time.Millisecond, // Default base interval
 			MaxInterval:   5 * time.Second,        // Default max interval
-			StepName:      typeErasedStepNameToStepName[stepName],
+			StepName: func() string {
+				if value, ok := typeErasedStepNameToStepName.Load(stepName); ok {
+					return value.(string)
+				}
+				return "" // This should never happen
+			}(),
 		}
 	}
 
@@ -719,15 +738,17 @@ func setStepParamDefaults(params *StepParams, stepName string) *StepParams {
 	if params.MaxInterval == 0 {
 		params.MaxInterval = 5 * time.Second // Default max interval
 	}
-	if params.StepName == "" {
+	if len(params.StepName) == 0 {
 		// If the step name is not provided, use the function name
-		params.StepName = typeErasedStepNameToStepName[stepName]
+		if value, ok := typeErasedStepNameToStepName.Load(stepName); ok {
+			params.StepName = value.(string)
+		}
 	}
 
 	return params
 }
 
-var typeErasedStepNameToStepName = make(map[string]string)
+var typeErasedStepNameToStepName sync.Map
 
 func RunAsStep[R any](ctx DBOSContext, fn GenericStepFunc[R]) (R, error) {
 	if ctx == nil {
@@ -742,7 +763,8 @@ func RunAsStep[R any](ctx DBOSContext, fn GenericStepFunc[R]) (R, error) {
 
 	// Type-erase the function
 	typeErasedFn := StepFunc(func(ctx context.Context) (any, error) { return fn(ctx) })
-	typeErasedStepNameToStepName[runtime.FuncForPC(reflect.ValueOf(typeErasedFn).Pointer()).Name()] = stepName
+	typeErasedFnName := runtime.FuncForPC(reflect.ValueOf(typeErasedFn).Pointer()).Name()
+	typeErasedStepNameToStepName.LoadOrStore(typeErasedFnName, stepName)
 
 	// Call the executor method and pass through the result/error
 	result, err := ctx.RunAsStep(ctx, typeErasedFn)
