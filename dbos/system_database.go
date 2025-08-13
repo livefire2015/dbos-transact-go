@@ -35,6 +35,8 @@ type systemDatabase interface {
 	updateWorkflowOutcome(ctx context.Context, input updateWorkflowOutcomeDBInput) error
 	awaitWorkflowResult(ctx context.Context, workflowID string) (any, error)
 	cancelWorkflow(ctx context.Context, workflowID string) error
+	resumeWorkflow(ctx context.Context, workflowID string) error
+	forkWorkflow(ctx context.Context, input forkWorkflowDBInput) error
 
 	// Child workflows
 	recordChildWorkflow(ctx context.Context, input recordChildWorkflowDBInput) error
@@ -47,7 +49,7 @@ type systemDatabase interface {
 	getWorkflowSteps(ctx context.Context, workflowID string) ([]stepInfo, error)
 
 	// Communication (special steps)
-	send(ctx context.Context, input WorkflowSendInputInternal) error
+	send(ctx context.Context, input WorkflowSendInput) error
 	recv(ctx context.Context, input WorkflowRecvInput) (any, error)
 	setEvent(ctx context.Context, input WorkflowSetEventInput) error
 	getEvent(ctx context.Context, input WorkflowGetEventInput) (any, error)
@@ -297,6 +299,17 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		return nil, fmt.Errorf("failed to serialize input: %w", err)
 	}
 
+	// Our DB works with NULL values
+	var applicationVersion *string
+	if len(input.status.ApplicationVersion) > 0 {
+		applicationVersion = &input.status.ApplicationVersion
+	}
+
+	var deduplicationID *string
+	if len(input.status.DeduplicationID) > 0 {
+		deduplicationID = &input.status.DeduplicationID
+	}
+
 	query := `INSERT INTO dbos.workflow_status (
         workflow_uuid,
         status,
@@ -342,7 +355,7 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		input.status.AssumedRole,
 		input.status.AuthenticatedRoles,
 		input.status.ExecutorID,
-		input.status.ApplicationVersion,
+		applicationVersion,
 		input.status.ApplicationID,
 		input.status.CreatedAt.UnixMilli(),
 		attempts,
@@ -350,7 +363,7 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 		timeoutMs,
 		deadline,
 		inputString,
-		input.status.DeduplicationID,
+		deduplicationID,
 		input.status.Priority,
 		WorkflowStatusEnqueued,
 		WorkflowStatusEnqueued,
@@ -428,6 +441,8 @@ type listWorkflowsDBInput struct {
 	limit              *int
 	offset             *int
 	sortDesc           bool
+	loadInput          bool
+	loadOutput         bool
 	tx                 pgx.Tx
 }
 
@@ -435,12 +450,22 @@ type listWorkflowsDBInput struct {
 func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) ([]WorkflowStatus, error) {
 	qb := newQueryBuilder()
 
-	// Build the base query
-	baseQuery := `SELECT workflow_uuid, status, name, authenticated_user, assumed_role, authenticated_roles,
-	                 output, error, executor_id, created_at, updated_at, application_version, application_id,
-	                 recovery_attempts, queue_name, workflow_timeout_ms, workflow_deadline_epoch_ms, started_at_epoch_ms,
-					 deduplication_id, inputs, priority
-	          FROM dbos.workflow_status`
+	// Build the base query with conditional column selection
+	loadColumns := []string{
+		"workflow_uuid", "status", "name", "authenticated_user", "assumed_role", "authenticated_roles",
+		"executor_id", "created_at", "updated_at", "application_version", "application_id",
+		"recovery_attempts", "queue_name", "workflow_timeout_ms", "workflow_deadline_epoch_ms", "started_at_epoch_ms",
+		"deduplication_id", "priority",
+	}
+
+	if input.loadOutput {
+		loadColumns = append(loadColumns, "output", "error")
+	}
+	if input.loadInput {
+		loadColumns = append(loadColumns, "inputs")
+	}
+
+	baseQuery := fmt.Sprintf("SELECT %s FROM dbos.workflow_status", strings.Join(loadColumns, ", "))
 
 	// Add filters using query builder
 	if input.workflowName != "" {
@@ -526,21 +551,45 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 		var deadlineMs, startedAtMs *int64
 		var outputString, inputString *string
 		var errorStr *string
+		var deduplicationID *string
+		var applicationVersion *string
+		var executorID *string
 
-		err := rows.Scan(
+		// Build scan arguments dynamically based on loaded columns
+		scanArgs := []interface{}{
 			&wf.ID, &wf.Status, &wf.Name, &wf.AuthenticatedUser, &wf.AssumedRole,
-			&wf.AuthenticatedRoles, &outputString, &errorStr, &wf.ExecutorID, &createdAtMs,
-			&updatedAtMs, &wf.ApplicationVersion, &wf.ApplicationID,
+			&wf.AuthenticatedRoles, &executorID, &createdAtMs,
+			&updatedAtMs, &applicationVersion, &wf.ApplicationID,
 			&wf.Attempts, &queueName, &timeoutMs,
-			&deadlineMs, &startedAtMs, &wf.DeduplicationID,
-			&inputString, &wf.Priority,
-		)
+			&deadlineMs, &startedAtMs, &deduplicationID, &wf.Priority,
+		}
+
+		if input.loadOutput {
+			scanArgs = append(scanArgs, &outputString, &errorStr)
+		}
+		if input.loadInput {
+			scanArgs = append(scanArgs, &inputString)
+		}
+
+		err := rows.Scan(scanArgs...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan workflow row: %w", err)
 		}
 
 		if queueName != nil && len(*queueName) > 0 {
 			wf.QueueName = *queueName
+		}
+
+		if executorID != nil && len(*executorID) > 0 {
+			wf.ExecutorID = *executorID
+		}
+
+		if applicationVersion != nil && len(*applicationVersion) > 0 {
+			wf.ApplicationVersion = *applicationVersion
+		}
+
+		if deduplicationID != nil && len(*deduplicationID) > 0 {
+			wf.DeduplicationID = *deduplicationID
 		}
 
 		// Convert milliseconds to time.Time
@@ -562,20 +611,26 @@ func (s *sysDB) listWorkflows(ctx context.Context, input listWorkflowsDBInput) (
 			wf.StartedAt = time.Unix(0, *startedAtMs*int64(time.Millisecond))
 		}
 
-		// Convert error string to error type if present
-		if errorStr != nil && *errorStr != "" {
-			wf.Error = errors.New(*errorStr)
+		// Handle output and error only if loadOutput is true
+		if input.loadOutput {
+			// Convert error string to error type if present
+			if errorStr != nil && *errorStr != "" {
+				wf.Error = errors.New(*errorStr)
+			}
+
+			// XXX maybe set wf.Output to outputString and run deserialize out of system DB
+			wf.Output, err = deserialize(outputString)
+			if err != nil {
+				return nil, fmt.Errorf("failed to deserialize output: %w", err)
+			}
 		}
 
-		// XXX maybe set wf.Output to outputString and run deserialize out of system DB
-		wf.Output, err = deserialize(outputString)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize output: %w", err)
-		}
-
-		wf.Input, err = deserialize(inputString)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize input: %w", err)
+		// Handle input only if loadInput is true
+		if input.loadInput {
+			wf.Input, err = deserialize(inputString)
+			if err != nil {
+				return nil, fmt.Errorf("failed to deserialize input: %w", err)
+			}
 		}
 
 		workflows = append(workflows, wf)
@@ -634,6 +689,8 @@ func (s *sysDB) cancelWorkflow(ctx context.Context, workflowID string) error {
 	// Check if workflow exists
 	listInput := listWorkflowsDBInput{
 		workflowIDs: []string{workflowID},
+		loadInput:   true,
+		loadOutput:  true,
 		tx:          tx,
 	}
 	wfs, err := s.listWorkflows(ctx, listInput)
@@ -662,6 +719,175 @@ func (s *sysDB) cancelWorkflow(ctx context.Context, workflowID string) error {
 	_, err = tx.Exec(ctx, updateStatusQuery, WorkflowStatusCancelled, time.Now().UnixMilli(), workflowID)
 	if err != nil {
 		return fmt.Errorf("failed to update workflow status to CANCELLED: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+func (s *sysDB) resumeWorkflow(ctx context.Context, workflowID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Execute with snapshot isolation in case of concurrent calls on the same workflow
+	_, err = tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+	if err != nil {
+		return fmt.Errorf("failed to set transaction isolation level: %w", err)
+	}
+
+	// Check the status of the workflow. If it is complete, do nothing.
+	listInput := listWorkflowsDBInput{
+		workflowIDs: []string{workflowID},
+		loadInput:   true,
+		loadOutput:  true,
+		tx:          tx,
+	}
+	wfs, err := s.listWorkflows(ctx, listInput)
+	if err != nil {
+		s.logger.Error("ResumeWorkflow: failed to list workflows", "error", err)
+		return err
+	}
+	if len(wfs) == 0 {
+		return newNonExistentWorkflowError(workflowID)
+	}
+
+	wf := wfs[0]
+	if wf.Status == WorkflowStatusSuccess || wf.Status == WorkflowStatusError {
+		return nil // Workflow is complete, do nothing
+	}
+
+	// If the original workflow has a timeout, let's recompute a deadline
+	var deadline *int64 = nil
+	if wf.Timeout > 0 {
+		deadlineMs := time.Now().Add(wf.Timeout).UnixMilli()
+		deadline = &deadlineMs
+	}
+
+	// Set the workflow's status to ENQUEUED and clear its recovery attempts, set new deadline
+	updateStatusQuery := `UPDATE dbos.workflow_status
+						  SET status = $1, queue_name = $2, recovery_attempts = $3, 
+						      workflow_deadline_epoch_ms = $4, deduplication_id = NULL,
+						      started_at_epoch_ms = NULL, updated_at = $5
+						  WHERE workflow_uuid = $6`
+
+	_, err = tx.Exec(ctx, updateStatusQuery,
+		WorkflowStatusEnqueued,
+		_DBOS_INTERNAL_QUEUE_NAME,
+		0,
+		deadline,
+		time.Now().UnixMilli(),
+		workflowID)
+	if err != nil {
+		return fmt.Errorf("failed to update workflow status to ENQUEUED: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+type forkWorkflowDBInput struct {
+	originalWorkflowID string
+	forkedWorkflowID   string
+	startStep          int
+	applicationVersion string
+}
+
+func (s *sysDB) forkWorkflow(ctx context.Context, input forkWorkflowDBInput) error {
+	// Validate startStep
+	if input.startStep < 0 {
+		return fmt.Errorf("startStep must be >= 0, got %d", input.startStep)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Get the original workflow status
+	listInput := listWorkflowsDBInput{
+		workflowIDs: []string{input.originalWorkflowID},
+		loadInput:   true,
+		tx:          tx,
+	}
+	wfs, err := s.listWorkflows(ctx, listInput)
+	if err != nil {
+		return fmt.Errorf("failed to list workflows: %w", err)
+	}
+	if len(wfs) == 0 {
+		return newNonExistentWorkflowError(input.originalWorkflowID)
+	}
+
+	originalWorkflow := wfs[0]
+
+	// Determine the application version to use
+	appVersion := originalWorkflow.ApplicationVersion
+	if input.applicationVersion != "" {
+		appVersion = input.applicationVersion
+	}
+
+	// Create an entry for the forked workflow with the same initial values as the original
+	insertQuery := `INSERT INTO dbos.workflow_status (
+		workflow_uuid,
+		status,
+		name,
+		authenticated_user,
+		assumed_role,
+		authenticated_roles,
+		application_version,
+		application_id,
+		queue_name,
+		inputs,
+		created_at,
+		updated_at,
+		recovery_attempts
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`
+
+	inputString, err := serialize(originalWorkflow.Input)
+	if err != nil {
+		return fmt.Errorf("failed to serialize input: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, insertQuery,
+		input.forkedWorkflowID,
+		WorkflowStatusEnqueued,
+		originalWorkflow.Name,
+		originalWorkflow.AuthenticatedUser,
+		originalWorkflow.AssumedRole,
+		originalWorkflow.AuthenticatedRoles,
+		&appVersion,
+		originalWorkflow.ApplicationID,
+		_DBOS_INTERNAL_QUEUE_NAME,
+		inputString,
+		time.Now().UnixMilli(),
+		time.Now().UnixMilli(),
+		0)
+
+	if err != nil {
+		return fmt.Errorf("failed to insert forked workflow status: %w", err)
+	}
+
+	// If startStep > 0, copy the original workflow's outputs into the forked workflow
+	if input.startStep > 0 {
+		copyOutputsQuery := `INSERT INTO dbos.operation_outputs
+			(workflow_uuid, function_id, output, error, function_name, child_workflow_id)
+			SELECT $1, function_id, output, error, function_name, child_workflow_id
+			FROM dbos.operation_outputs
+			WHERE workflow_uuid = $2 AND function_id < $3`
+
+		_, err = tx.Exec(ctx, copyOutputsQuery, input.forkedWorkflowID, input.originalWorkflowID, input.startStep)
+		if err != nil {
+			return fmt.Errorf("failed to copy operation outputs: %w", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -1166,7 +1392,7 @@ func (s *sysDB) notificationListenerLoop(ctx context.Context) {
 
 const _DBOS_NULL_TOPIC = "__null__topic__"
 
-type WorkflowSendInputInternal struct {
+type WorkflowSendInput struct {
 	DestinationID string
 	Message       any
 	Topic         string
@@ -1175,7 +1401,7 @@ type WorkflowSendInputInternal struct {
 // Send is a special type of step that sends a message to another workflow.
 // Can be called both within a workflow (as a step) or outside a workflow (directly).
 // When called within a workflow: durability and the function run in the same transaction, and we forbid nested step execution
-func (s *sysDB) send(ctx context.Context, input WorkflowSendInputInternal) error {
+func (s *sysDB) send(ctx context.Context, input WorkflowSendInput) error {
 	functionName := "DBOS.send"
 
 	// Get workflow state from context (optional for Send as we can send from outside a workflow)

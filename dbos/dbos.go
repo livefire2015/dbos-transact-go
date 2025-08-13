@@ -54,7 +54,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 
 	// Load defaults
 	if dbosConfig.Logger == nil {
-		dbosConfig.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		dbosConfig.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	}
 
 	return dbosConfig, nil
@@ -76,15 +76,21 @@ type DBOSContext interface {
 	// Workflow operations
 	RunAsStep(_ DBOSContext, fn StepFunc) (any, error)                                                            // Execute a function as a durable step within a workflow
 	RunAsWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opts ...WorkflowOption) (WorkflowHandle[any], error) // Start a new workflow execution
-	Send(_ DBOSContext, input WorkflowSendInputInternal) error                                                    // Send a message to another workflow
+	Send(_ DBOSContext, input WorkflowSendInput) error                                                            // Send a message to another workflow
 	Recv(_ DBOSContext, input WorkflowRecvInput) (any, error)                                                     // Receive a message sent to this workflow
 	SetEvent(_ DBOSContext, input WorkflowSetEventInput) error                                                    // Set a key-value event for this workflow
 	GetEvent(_ DBOSContext, input WorkflowGetEventInput) (any, error)                                             // Get a key-value event from a target workflow
 	Sleep(duration time.Duration) (time.Duration, error)                                                          // Durable sleep that survives workflow recovery
 	GetWorkflowID() (string, error)                                                                               // Get the current workflow ID (only available within workflows)
+	GetStepID() (int, error)                                                                                      // Get the current step ID (only available within workflows)
 
 	// Workflow management
-	RetrieveWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error) // Get a handle to an existing workflow
+	RetrieveWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error)   // Get a handle to an existing workflow
+	Enqueue(_ DBOSContext, params EnqueueOptions) (WorkflowHandle[any], error)        // Enqueue a new workflow with parameters
+	CancelWorkflow(workflowID string) error                                           // Cancel a workflow by setting its status to CANCELLED
+	ResumeWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error)     // Resume a cancelled workflow
+	ForkWorkflow(_ DBOSContext, input ForkWorkflowInput) (WorkflowHandle[any], error) // Fork a workflow from a specific step
+	ListWorkflows(opts ...ListWorkflowsOption) ([]WorkflowStatus, error)              // List workflows based on filtering criteria
 
 	// Accessors
 	GetApplicationVersion() string // Get the application version for this context
@@ -114,8 +120,9 @@ type dbosContext struct {
 	workflowsWg *sync.WaitGroup
 
 	// Workflow registry
-	workflowRegistry map[string]workflowRegistryEntry
-	workflowRegMutex *sync.RWMutex
+	workflowRegistry        map[string]workflowRegistryEntry
+	workflowRegMutex        *sync.RWMutex
+	workflowCustomNametoFQN sync.Map // Maps fully qualified workflow names to custom names. Usefor when client enqueues a workflow by name because registry is indexed by FQN.
 
 	// Workflow scheduler
 	workflowScheduler *cron.Cron

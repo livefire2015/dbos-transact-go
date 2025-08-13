@@ -23,12 +23,12 @@ import (
 type WorkflowStatusType string
 
 const (
-	WorkflowStatusPending         WorkflowStatusType = "PENDING"          // Workflow is running or ready to run
-	WorkflowStatusEnqueued        WorkflowStatusType = "ENQUEUED"         // Workflow is queued and waiting for execution
-	WorkflowStatusSuccess         WorkflowStatusType = "SUCCESS"          // Workflow completed successfully
-	WorkflowStatusError           WorkflowStatusType = "ERROR"            // Workflow completed with an error
-	WorkflowStatusCancelled       WorkflowStatusType = "CANCELLED"        // Workflow was cancelled (manually or due to timeout)
-	WorkflowStatusRetriesExceeded WorkflowStatusType = "RETRIES_EXCEEDED" // Workflow exceeded maximum retry attempts
+	WorkflowStatusPending         WorkflowStatusType = "PENDING"                        // Workflow is running or ready to run
+	WorkflowStatusEnqueued        WorkflowStatusType = "ENQUEUED"                       // Workflow is queued and waiting for execution
+	WorkflowStatusSuccess         WorkflowStatusType = "SUCCESS"                        // Workflow completed successfully
+	WorkflowStatusError           WorkflowStatusType = "ERROR"                          // Workflow completed with an error
+	WorkflowStatusCancelled       WorkflowStatusType = "CANCELLED"                      // Workflow was cancelled (manually or due to timeout)
+	WorkflowStatusRetriesExceeded WorkflowStatusType = "MAX_RECOVERY_ATTEMPTS_EXCEEDED" // Workflow exceeded maximum retry attempts
 )
 
 // WorkflowStatus contains comprehensive information about a workflow's current state and execution history.
@@ -52,7 +52,7 @@ type WorkflowStatus struct {
 	Timeout            time.Duration      `json:"timeout"`             // Workflow timeout duration
 	Deadline           time.Time          `json:"deadline"`            // Absolute deadline for workflow completion
 	StartedAt          time.Time          `json:"started_at"`          // When the workflow execution actually started
-	DeduplicationID    *string            `json:"deduplication_id"`    // Deduplication identifier (if applicable)
+	DeduplicationID    string             `json:"deduplication_id"`    // Deduplication identifier (if applicable)
 	Input              any                `json:"input"`               // Input parameters passed to the workflow
 	Priority           int                `json:"priority"`            // Execution priority (lower numbers have higher priority)
 }
@@ -131,6 +131,8 @@ func (h *workflowHandle[R]) GetResult() (R, error) {
 func (h *workflowHandle[R]) GetStatus() (WorkflowStatus, error) {
 	workflowStatuses, err := h.dbosContext.(*dbosContext).systemDB.listWorkflows(h.dbosContext, listWorkflowsDBInput{
 		workflowIDs: []string{h.workflowID},
+		loadInput:   true,
+		loadOutput:  true,
 	})
 	if err != nil {
 		return WorkflowStatus{}, fmt.Errorf("failed to get workflow status: %w", err)
@@ -188,6 +190,8 @@ func (h *workflowPollingHandle[R]) GetResult() (R, error) {
 func (h *workflowPollingHandle[R]) GetStatus() (WorkflowStatus, error) {
 	workflowStatuses, err := h.dbosContext.(*dbosContext).systemDB.listWorkflows(h.dbosContext, listWorkflowsDBInput{
 		workflowIDs: []string{h.workflowID},
+		loadInput:   true,
+		loadOutput:  true,
 	})
 	if err != nil {
 		return WorkflowStatus{}, fmt.Errorf("failed to get workflow status: %w", err)
@@ -234,10 +238,18 @@ func registerWorkflow(ctx DBOSContext, workflowFQN string, fn WrappedWorkflowFun
 		panic(newConflictingRegistrationError(workflowFQN))
 	}
 
+	// We must keep the registry indexed by FQN (because RunAsWorkflow uses reflection to find the function name and uses that to look it up in the registry)
 	c.workflowRegistry[workflowFQN] = workflowRegistryEntry{
 		wrappedFunction: fn,
 		maxRetries:      maxRetries,
 		name:            customName,
+	}
+
+	// We need to get a mapping from custom name to FQN for registry lookups that might not know the FQN (queue, recovery)
+	if len(customName) > 0 {
+		c.workflowCustomNametoFQN.Store(customName, workflowFQN)
+	} else {
+		c.workflowCustomNametoFQN.Store(workflowFQN, workflowFQN) // Store the FQN as the custom name if none was provided
 	}
 }
 
@@ -371,6 +383,7 @@ func RegisterWorkflow[P any, R any](ctx DBOSContext, fn GenericWorkflowFunc[P, R
 		// This type check is redundant with the one in the wrapper, but I'd better be safe than sorry
 		typedInput, ok := input.(P)
 		if !ok {
+			// FIXME: we need to record the error in the database here
 			return nil, newWorkflowUnexpectedInputType(fqn, fmt.Sprintf("%T", typedInput), fmt.Sprintf("%T", input))
 		}
 		return fn(ctx, typedInput)
@@ -379,6 +392,7 @@ func RegisterWorkflow[P any, R any](ctx DBOSContext, fn GenericWorkflowFunc[P, R
 	typeErasedWrapper := WrappedWorkflowFunc(func(ctx DBOSContext, input any, opts ...WorkflowOption) (WorkflowHandle[any], error) {
 		typedInput, ok := input.(P)
 		if !ok {
+			// FIXME: we need to record the error in the database here
 			return nil, newWorkflowUnexpectedInputType(fqn, fmt.Sprintf("%T", typedInput), fmt.Sprintf("%T", input))
 		}
 
@@ -1000,14 +1014,14 @@ func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc) (any, error) {
 /******* WORKFLOW COMMUNICATIONS ********/
 /****************************************/
 
-// WorkflowSendInput defines the parameters for sending a message to another workflow.
-type WorkflowSendInput[R any] struct {
+// GenericWorkflowSendInput defines the parameters for sending a message to another workflow.
+type GenericWorkflowSendInput[P any] struct {
 	DestinationID string // Workflow ID to send the message to
-	Message       R      // Message payload (must be gob-encodable)
+	Message       P      // Message payload (must be gob-encodable)
 	Topic         string // Optional topic for message filtering
 }
 
-func (c *dbosContext) Send(_ DBOSContext, input WorkflowSendInputInternal) error {
+func (c *dbosContext) Send(_ DBOSContext, input WorkflowSendInput) error {
 	return c.systemDB.send(c, input)
 }
 
@@ -1024,13 +1038,13 @@ func (c *dbosContext) Send(_ DBOSContext, input WorkflowSendInputInternal) error
 //	    Message:       "Hello from sender",
 //	    Topic:         "notifications",
 //	})
-func Send[R any](ctx DBOSContext, input WorkflowSendInput[R]) error {
+func Send[P any](ctx DBOSContext, input GenericWorkflowSendInput[P]) error {
 	if ctx == nil {
 		return errors.New("ctx cannot be nil")
 	}
-	var typedMessage R
+	var typedMessage P
 	gob.Register(typedMessage)
-	return ctx.Send(ctx, WorkflowSendInputInternal{
+	return ctx.Send(ctx, WorkflowSendInput{
 		DestinationID: input.DestinationID,
 		Message:       input.Message,
 		Topic:         input.Topic,
@@ -1085,10 +1099,10 @@ func Recv[R any](ctx DBOSContext, input WorkflowRecvInput) (R, error) {
 	return typedMessage, nil
 }
 
-// WorkflowSetEventInputGeneric defines the parameters for setting a workflow event.
-type WorkflowSetEventInputGeneric[R any] struct {
+// GenericWorkflowSetEventInput defines the parameters for setting a workflow event.
+type GenericWorkflowSetEventInput[P any] struct {
 	Key     string // Event key identifier
-	Message R      // Event value (must be gob-encodable)
+	Message P      // Event value (must be gob-encodable)
 }
 
 func (c *dbosContext) SetEvent(_ DBOSContext, input WorkflowSetEventInput) error {
@@ -1108,11 +1122,11 @@ func (c *dbosContext) SetEvent(_ DBOSContext, input WorkflowSetEventInput) error
 //	    Key:     "status",
 //	    Message: "processing-complete",
 //	})
-func SetEvent[R any](ctx DBOSContext, input WorkflowSetEventInputGeneric[R]) error {
+func SetEvent[P any](ctx DBOSContext, input GenericWorkflowSetEventInput[P]) error {
 	if ctx == nil {
 		return errors.New("ctx cannot be nil")
 	}
-	var typedMessage R
+	var typedMessage P
 	gob.Register(typedMessage)
 	return ctx.SetEvent(ctx, WorkflowSetEventInput{
 		Key:     input.Key,
@@ -1151,7 +1165,7 @@ func (c *dbosContext) GetEvent(_ DBOSContext, input WorkflowGetEventInput) (any,
 //	log.Printf("Status: %s", status)
 func GetEvent[R any](ctx DBOSContext, input WorkflowGetEventInput) (R, error) {
 	if ctx == nil {
-		return *new(R), errors.New("dbosCtx cannot be nil")
+		return *new(R), errors.New("ctx cannot be nil")
 	}
 	value, err := ctx.GetEvent(ctx, input)
 	if err != nil {
@@ -1170,6 +1184,24 @@ func GetEvent[R any](ctx DBOSContext, input WorkflowGetEventInput) (R, error) {
 
 func (c *dbosContext) Sleep(duration time.Duration) (time.Duration, error) {
 	return c.systemDB.sleep(c, duration)
+}
+
+// Sleep pauses workflow execution for the specified duration.
+// This is a durable sleep - if the workflow is recovered during the sleep period,
+// it will continue sleeping for the remaining time.
+// Returns the actual duration slept.
+//
+// Example:
+//
+//	actualDuration, err := dbos.Sleep(ctx, 5*time.Second)
+//	if err != nil {
+//	    return err
+//	}
+func Sleep(ctx DBOSContext, duration time.Duration) (time.Duration, error) {
+	if ctx == nil {
+		return 0, errors.New("ctx cannot be nil")
+	}
+	return ctx.Sleep(duration)
 }
 
 /***********************************/
@@ -1194,9 +1226,47 @@ func (c *dbosContext) GetStepID() (int, error) {
 	return wfState.stepID, nil
 }
 
+// GetWorkflowID retrieves the workflow ID from the context if called within a DBOS workflow.
+// Returns an error if not called from within a workflow context.
+//
+// Example:
+//
+//	workflowID, err := dbos.GetWorkflowID(ctx)
+//	if err != nil {
+//	    log.Printf("Not in a workflow context: %v", err)
+//	} else {
+//	    log.Printf("Current workflow ID: %s", workflowID)
+//	}
+func GetWorkflowID(ctx DBOSContext) (string, error) {
+	if ctx == nil {
+		return "", errors.New("ctx cannot be nil")
+	}
+	return ctx.GetWorkflowID()
+}
+
+// GetStepID retrieves the current step ID from the context if called within a DBOS workflow.
+// Returns -1 and an error if not called from within a workflow context.
+//
+// Example:
+//
+//	stepID, err := dbos.GetStepID(ctx)
+//	if err != nil {
+//	    log.Printf("Not in a workflow context: %v", err)
+//	} else {
+//	    log.Printf("Current step ID: %d", stepID)
+//	}
+func GetStepID(ctx DBOSContext) (int, error) {
+	if ctx == nil {
+		return -1, errors.New("ctx cannot be nil")
+	}
+	return ctx.GetStepID()
+}
+
 func (c *dbosContext) RetrieveWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error) {
 	workflowStatus, err := c.systemDB.listWorkflows(c, listWorkflowsDBInput{
 		workflowIDs: []string{workflowID},
+		loadInput:   true,
+		loadOutput:  true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve workflow status: %w", err)
@@ -1228,6 +1298,11 @@ func RetrieveWorkflow[R any](ctx DBOSContext, workflowID string) (workflowPollin
 	if ctx == nil {
 		return workflowPollingHandle[R]{}, errors.New("dbosCtx cannot be nil")
 	}
+
+	// Register the output for gob encoding
+	var r R
+	gob.Register(r)
+
 	workflowStatus, err := ctx.(*dbosContext).systemDB.listWorkflows(ctx, listWorkflowsDBInput{
 		workflowIDs: []string{workflowID},
 	})
@@ -1238,4 +1313,634 @@ func RetrieveWorkflow[R any](ctx DBOSContext, workflowID string) (workflowPollin
 		return workflowPollingHandle[R]{}, newNonExistentWorkflowError(workflowID)
 	}
 	return workflowPollingHandle[R]{workflowID: workflowID, dbosContext: ctx}, nil
+}
+
+type EnqueueOptions struct {
+	WorkflowName       string
+	QueueName          string
+	WorkflowID         string
+	ApplicationVersion string
+	DeduplicationID    string
+	WorkflowTimeout    time.Duration
+	WorkflowInput      any
+}
+
+func (c *dbosContext) Enqueue(_ DBOSContext, params EnqueueOptions) (WorkflowHandle[any], error) {
+	workflowID := params.WorkflowID
+	if workflowID == "" {
+		workflowID = uuid.New().String()
+	}
+
+	var deadline time.Time
+	if params.WorkflowTimeout > 0 {
+		deadline = time.Now().Add(params.WorkflowTimeout)
+	}
+
+	status := WorkflowStatus{
+		Name:               params.WorkflowName,
+		ApplicationVersion: params.ApplicationVersion,
+		Status:             WorkflowStatusEnqueued,
+		ID:                 workflowID,
+		CreatedAt:          time.Now(),
+		Deadline:           deadline,
+		Timeout:            params.WorkflowTimeout,
+		Input:              params.WorkflowInput,
+		QueueName:          params.QueueName,
+		DeduplicationID:    params.DeduplicationID,
+	}
+
+	uncancellableCtx := WithoutCancel(c)
+
+	tx, err := c.systemDB.(*sysDB).pool.Begin(uncancellableCtx)
+	if err != nil {
+		return nil, newWorkflowExecutionError(workflowID, fmt.Sprintf("failed to begin transaction: %v", err))
+	}
+	defer tx.Rollback(uncancellableCtx) // Rollback if not committed
+
+	// Insert workflow status with transaction
+	insertInput := insertWorkflowStatusDBInput{
+		status: status,
+		tx:     tx,
+	}
+	_, err = c.systemDB.insertWorkflowStatus(uncancellableCtx, insertInput)
+	if err != nil {
+		c.logger.Error("failed to insert workflow status", "error", err, "workflow_id", workflowID)
+		return nil, err
+	}
+
+	if err := tx.Commit(uncancellableCtx); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return &workflowPollingHandle[any]{
+		workflowID:  workflowID,
+		dbosContext: uncancellableCtx,
+	}, nil
+}
+
+type GenericEnqueueOptions[P any] struct {
+	WorkflowName       string
+	QueueName          string
+	WorkflowID         string
+	ApplicationVersion string
+	DeduplicationID    string
+	WorkflowTimeout    time.Duration
+	WorkflowInput      P
+}
+
+// Enqueue adds a workflow to a named queue for later execution with type safety.
+// The workflow will be persisted with ENQUEUED status until picked up by a DBOS process.
+// This provides asynchronous workflow execution with durability guarantees.
+//
+// Parameters:
+//   - ctx: DBOS context for the operation
+//   - params: Configuration parameters including workflow name, queue name, input, and options
+//
+// The params struct contains:
+//   - WorkflowName: Name of the registered workflow function to execute (required)
+//   - QueueName: Name of the queue to enqueue the workflow to (required)
+//   - WorkflowID: Custom workflow ID (optional, auto-generated if empty)
+//   - ApplicationVersion: Application version override (optional)
+//   - DeduplicationID: Deduplication identifier for idempotent enqueuing (optional)
+//   - WorkflowTimeout: Maximum execution time for the workflow (optional)
+//   - WorkflowInput: Input parameters to pass to the workflow (type P)
+//
+// Returns a typed workflow handle that can be used to check status and retrieve results.
+// The handle uses polling to check workflow completion since the execution is asynchronous.
+//
+// Example usage:
+//
+//	// Enqueue a workflow with string input and int output
+//	handle, err := dbos.Enqueue[string, int](ctx, dbos.GenericEnqueueOptions[string]{
+//	    WorkflowName:    "ProcessDataWorkflow",
+//	    QueueName:       "data-processing",
+//	    WorkflowInput:   "input data",
+//	    WorkflowTimeout: 30 * time.Minute,
+//	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Check status
+//	status, err := handle.GetStatus()
+//	if err != nil {
+//	    log.Printf("Failed to get status: %v", err)
+//	}
+//
+//	// Wait for completion and get result
+//	result, err := handle.GetResult() // blocks until completion
+//	if err != nil {
+//	    log.Printf("Workflow failed: %v", err)
+//	} else {
+//	    log.Printf("Result: %d", result)
+//	}
+//
+//	// Enqueue with deduplication and custom workflow ID
+//	handle, err := dbos.Enqueue[MyInputType, MyOutputType](ctx, dbos.GenericEnqueueOptions[MyInputType]{
+//	    WorkflowName:    "MyWorkflow",
+//	    QueueName:       "my-queue",
+//	    WorkflowID:      "custom-workflow-id",
+//	    DeduplicationID: "unique-operation-id",
+//	    WorkflowInput:   MyInputType{Field: "value"},
+//	})
+func Enqueue[P any, R any](ctx DBOSContext, params GenericEnqueueOptions[P]) (WorkflowHandle[R], error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+
+	// Register the input and outputs for gob encoding
+	var typedInput P
+	gob.Register(typedInput)
+	var typedOutput R
+	gob.Register(typedOutput)
+
+	// Call typed erased enqueue
+	handle, err := ctx.Enqueue(ctx, EnqueueOptions{
+		WorkflowName:       params.WorkflowName,
+		QueueName:          params.QueueName,
+		WorkflowID:         params.WorkflowID,
+		ApplicationVersion: params.ApplicationVersion,
+		DeduplicationID:    params.DeduplicationID,
+		WorkflowInput:      params.WorkflowInput,
+		WorkflowTimeout:    params.WorkflowTimeout,
+	})
+
+	return &workflowPollingHandle[R]{
+		workflowID:  handle.GetWorkflowID(),
+		dbosContext: ctx,
+	}, err
+}
+
+// CancelWorkflow cancels a running or enqueued workflow by setting its status to CANCELLED.
+// Once cancelled, the workflow will stop executing. Currently executing steps will not be interrupted.
+//
+// Parameters:
+//   - workflowID: The unique identifier of the workflow to cancel
+//
+// Returns an error if the workflow does not exist or if the cancellation operation fails.
+func (c *dbosContext) CancelWorkflow(workflowID string) error {
+	return c.systemDB.cancelWorkflow(c, workflowID)
+}
+
+// CancelWorkflow cancels a running or enqueued workflow by setting its status to CANCELLED.
+// Once cancelled, the workflow will stop executing. Currently executing steps will not be interrupted.
+//
+// Parameters:
+//   - ctx: DBOS context for the operation
+//   - workflowID: The unique identifier of the workflow to cancel
+//
+// Returns an error if the workflow does not exist or if the cancellation operation fails.
+//
+// Example:
+//
+//	err := dbos.CancelWorkflow(ctx, "workflow-to-cancel")
+//	if err != nil {
+//	    log.Printf("Failed to cancel workflow: %v", err)
+//	}
+func CancelWorkflow(ctx DBOSContext, workflowID string) error {
+	if ctx == nil {
+		return errors.New("ctx cannot be nil")
+	}
+	return ctx.CancelWorkflow(workflowID)
+}
+
+func (c *dbosContext) ResumeWorkflow(_ DBOSContext, workflowID string) (WorkflowHandle[any], error) {
+	err := c.systemDB.resumeWorkflow(c, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	return &workflowPollingHandle[any]{workflowID: workflowID, dbosContext: c}, nil
+}
+
+// ResumeWorkflow resumes a cancelled workflow by setting its status back to ENQUEUED.
+// The workflow will be picked up by a DBOS queue processor and execution will continue
+// from where it left off. If the workflow is already completed, this is a no-op.
+// Returns a handle that can be used to wait for completion and retrieve results.
+// Returns an error if the workflow does not exist or if the cancellation operation fails.
+//
+// Example:
+//
+//	handle, err := dbos.ResumeWorkflow[int](ctx, "workflow-id")
+//	if err != nil {
+//	    log.Printf("Failed to resume workflow: %v", err)
+//	} else {
+//	    result, err := handle.GetResult() // blocks until completion
+//	    if err != nil {
+//	        log.Printf("Workflow failed: %v", err)
+//	    } else {
+//	        log.Printf("Result: %d", result)
+//	    }
+//	}
+func ResumeWorkflow[R any](ctx DBOSContext, workflowID string) (WorkflowHandle[R], error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+
+	// Register the output for gob encoding
+	var r R
+	gob.Register(r)
+
+	_, err := ctx.ResumeWorkflow(ctx, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	return &workflowPollingHandle[R]{workflowID: workflowID, dbosContext: ctx}, nil
+}
+
+// ForkWorkflowInput holds configuration parameters for forking workflows.
+type ForkWorkflowInput struct {
+	OriginalWorkflowID string // Required: The UUID of the original workflow to fork from
+	ForkedWorkflowID   string // Optional: Custom workflow ID for the forked workflow (auto-generated if empty)
+	StartStep          uint   // Optional: Step to start the forked workflow from (default: 0)
+	ApplicationVersion string // Optional: Application version for the forked workflow (inherits from original if empty)
+}
+
+func (c *dbosContext) ForkWorkflow(_ DBOSContext, input ForkWorkflowInput) (WorkflowHandle[any], error) {
+	if input.OriginalWorkflowID == "" {
+		return nil, errors.New("original workflow ID cannot be empty")
+	}
+
+	// Generate new workflow ID if not provided
+	forkedWorkflowID := input.ForkedWorkflowID
+	if forkedWorkflowID == "" {
+		forkedWorkflowID = uuid.New().String()
+	}
+
+	// Create input for system database
+	dbInput := forkWorkflowDBInput{
+		originalWorkflowID: input.OriginalWorkflowID,
+		forkedWorkflowID:   forkedWorkflowID,
+		startStep:          int(input.StartStep),
+		applicationVersion: input.ApplicationVersion,
+	}
+
+	// Call system database method
+	err := c.systemDB.forkWorkflow(c, dbInput)
+	if err != nil {
+		return nil, err
+	}
+
+	return &workflowPollingHandle[any]{
+		workflowID:  forkedWorkflowID,
+		dbosContext: c,
+	}, nil
+}
+
+// ForkWorkflow creates a new workflow instance by copying an existing workflow from a specific step.
+// The forked workflow will have a new UUID and will execute from the specified StartStep.
+// If StartStep > 0, the forked workflow will reuse the operation outputs from steps 0 to StartStep-1
+// copied from the original workflow.
+//
+// Parameters:
+//   - ctx: DBOS context for the operation
+//   - input: Configuration parameters for the forked workflow
+//
+// The input struct contains:
+//   - OriginalWorkflowID: The UUID of the original workflow to fork from (required)
+//   - ForkedWorkflowID: Custom workflow ID for the forked workflow (optional, auto-generated if empty)
+//   - StartStep: Step to start the forked workflow from (optional, default: 0)
+//   - ApplicationVersion: Application version for the forked workflow (optional, inherits from original if empty)
+//
+// Returns a typed workflow handle for the newly created forked workflow.
+//
+// Example usage:
+//
+//	// Basic fork from step 5
+//	handle, err := dbos.ForkWorkflow[MyResultType](ctx, dbos.ForkWorkflowInput{
+//	    OriginalWorkflowID: "original-workflow-id",
+//	    StartStep:          5,
+//	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Fork with custom workflow ID and application version
+//	handle, err := dbos.ForkWorkflow[MyResultType](ctx, dbos.ForkWorkflowInput{
+//	    OriginalWorkflowID: "original-workflow-id",
+//	    ForkedWorkflowID:   "my-custom-fork-id",
+//	    StartStep:          3,
+//	    ApplicationVersion: "v2.0.0",
+//	})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+func ForkWorkflow[R any](ctx DBOSContext, input ForkWorkflowInput) (WorkflowHandle[R], error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+
+	// Register the output for gob encoding
+	var r R
+	gob.Register(r)
+
+	handle, err := ctx.ForkWorkflow(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return &workflowPollingHandle[R]{
+		workflowID:  handle.GetWorkflowID(),
+		dbosContext: ctx,
+	}, nil
+}
+
+// listWorkflowsParams holds configuration parameters for listing workflows
+type listWorkflowsParams struct {
+	workflowIDs      []string
+	status           []WorkflowStatusType
+	startTime        time.Time
+	endTime          time.Time
+	name             string
+	appVersion       string
+	user             string
+	limit            *int
+	offset           *int
+	sortDesc         bool
+	workflowIDPrefix string
+	loadInput        bool
+	loadOutput       bool
+}
+
+// ListWorkflowsOption is a functional option for configuring workflow listing parameters.
+type ListWorkflowsOption func(*listWorkflowsParams)
+
+// WithWorkflowIDs filters workflows by the specified workflow IDs.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithWorkflowIDs([]string{"workflow1", "workflow2"}))
+func WithWorkflowIDs(workflowIDs []string) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.workflowIDs = workflowIDs
+	}
+}
+
+// WithStatus filters workflows by the specified status(es).
+// Can accept a single status or a list of statuses.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithStatus([]dbos.WorkflowStatusType{dbos.WorkflowStatusSuccess, dbos.WorkflowStatusError}))
+func WithStatus(status []WorkflowStatusType) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.status = status
+	}
+}
+
+// WithStartTime filters workflows created after the specified time.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithStartTime(time.Now().Add(-24*time.Hour)))
+func WithStartTime(startTime time.Time) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.startTime = startTime
+	}
+}
+
+// WithEndTime filters workflows created before the specified time.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithEndTime(time.Now()))
+func WithEndTime(endTime time.Time) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.endTime = endTime
+	}
+}
+
+// WithName filters workflows by the specified workflow function name.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithName("MyWorkflowFunction"))
+func WithName(name string) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.name = name
+	}
+}
+
+// WithAppVersion filters workflows by the specified application version.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithAppVersion("v1.0.0"))
+func WithAppVersion(appVersion string) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.appVersion = appVersion
+	}
+}
+
+// WithUser filters workflows by the specified authenticated user.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithUser("john.doe"))
+func WithUser(user string) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.user = user
+	}
+}
+
+// WithLimit limits the number of workflows returned.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithLimit(100))
+func WithLimit(limit int) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.limit = &limit
+	}
+}
+
+// WithOffset sets the offset for pagination.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithOffset(50), dbos.WithLimit(25))
+func WithOffset(offset int) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.offset = &offset
+	}
+}
+
+// WithSortDesc enables descending sort by creation time (default is ascending).
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithSortDesc(true))
+func WithSortDesc(sortDesc bool) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.sortDesc = sortDesc
+	}
+}
+
+// WithWorkflowIDPrefix filters workflows by workflow ID prefix.
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithWorkflowIDPrefix("batch-"))
+func WithWorkflowIDPrefix(prefix string) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.workflowIDPrefix = prefix
+	}
+}
+
+// WithLoadInput controls whether to load workflow input data (default: true).
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithLoadInput(false))
+func WithLoadInput(loadInput bool) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.loadInput = loadInput
+	}
+}
+
+// WithLoadOutput controls whether to load workflow output data (default: true).
+//
+// Example:
+//
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithLoadOutput(false))
+func WithLoadOutput(loadOutput bool) ListWorkflowsOption {
+	return func(p *listWorkflowsParams) {
+		p.loadOutput = loadOutput
+	}
+}
+
+// ListWorkflows retrieves a list of workflows based on the provided filters.
+//
+// The function supports filtering by workflow IDs, status, time ranges, names, application versions,
+// authenticated users, workflow ID prefixes, and more. It also supports pagination through
+// limit/offset parameters and sorting control (ascending by default, or descending with WithSortDesc).
+//
+// By default, both input and output data are loaded for each workflow. This can be controlled
+// using WithLoadInput(false) and WithLoadOutput(false) options for better performance when
+// the data is not needed.
+//
+// Parameters:
+//   - opts: Functional options to configure the query filters and parameters
+//
+// Returns a slice of WorkflowStatus structs containing the workflow information.
+//
+// Example usage:
+//
+//	// List all successful workflows from the last 24 hours
+//	workflows, err := ctx.ListWorkflows(
+//	    dbos.WithStatus([]dbos.WorkflowStatusType{dbos.WorkflowStatusSuccess}),
+//	    dbos.WithStartTime(time.Now().Add(-24*time.Hour)),
+//	    dbos.WithLimit(100))
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// List workflows by specific IDs without loading input/output data
+//	workflows, err := ctx.ListWorkflows(
+//	    dbos.WithWorkflowIDs([]string{"workflow1", "workflow2"}),
+//	    dbos.WithLoadInput(false),
+//	    dbos.WithLoadOutput(false))
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// List workflows with pagination
+//	workflows, err := ctx.ListWorkflows(
+//	    dbos.WithUser("john.doe"),
+//	    dbos.WithOffset(50),
+//	    dbos.WithLimit(25),
+//	    dbos.WithSortDesc(true))
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+func (c *dbosContext) ListWorkflows(opts ...ListWorkflowsOption) ([]WorkflowStatus, error) {
+
+	// Initialize parameters with defaults
+	params := &listWorkflowsParams{
+		loadInput:  true, // Default to loading input
+		loadOutput: true, // Default to loading output
+	}
+
+	// Apply all provided options
+	for _, opt := range opts {
+		opt(params)
+	}
+
+	// Convert to system database input structure
+	dbInput := listWorkflowsDBInput{
+		workflowIDs:        params.workflowIDs,
+		status:             params.status,
+		startTime:          params.startTime,
+		endTime:            params.endTime,
+		workflowName:       params.name,
+		applicationVersion: params.appVersion,
+		authenticatedUser:  params.user,
+		limit:              params.limit,
+		offset:             params.offset,
+		sortDesc:           params.sortDesc,
+		workflowIDPrefix:   params.workflowIDPrefix,
+		loadInput:          params.loadInput,
+		loadOutput:         params.loadOutput,
+	}
+
+	// Call the context method to list workflows
+	workflows, err := c.systemDB.listWorkflows(c, dbInput)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list workflows: %w", err)
+	}
+
+	return workflows, nil
+}
+
+// ListWorkflows retrieves a list of workflows based on the provided filters.
+//
+// The function supports filtering by workflow IDs, status, time ranges, names, application versions,
+// authenticated users, workflow ID prefixes, and more. It also supports pagination through
+// limit/offset parameters and sorting control (ascending by default, or descending with WithSortDesc).
+//
+// By default, both input and output data are loaded for each workflow. This can be controlled
+// using WithLoadInput(false) and WithLoadOutput(false) options for better performance when
+// the data is not needed.
+//
+// Parameters:
+//   - ctx: DBOS context for the operation
+//   - opts: Functional options to configure the query filters and parameters
+//
+// Returns a slice of WorkflowStatus structs containing the workflow information.
+//
+// Example usage:
+//
+//	// List all successful workflows from the last 24 hours
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithStatus([]dbos.WorkflowStatusType{dbos.WorkflowStatusSuccess}),
+//	    dbos.WithStartTime(time.Now().Add(-24*time.Hour)),
+//	    dbos.WithLimit(100))
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// List workflows by specific IDs without loading input/output data
+//	workflows, err := dbos.ListWorkflows(ctx,
+//	    dbos.WithWorkflowIDs([]string{"workflow1", "workflow2"}),
+//	    dbos.WithLoadInput(false),
+//	    dbos.WithLoadOutput(false))
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+func ListWorkflows(ctx DBOSContext, opts ...ListWorkflowsOption) ([]WorkflowStatus, error) {
+	if ctx == nil {
+		return nil, errors.New("ctx cannot be nil")
+	}
+	return ctx.ListWorkflows(opts...)
 }

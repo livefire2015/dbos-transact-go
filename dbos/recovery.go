@@ -11,6 +11,7 @@ func recoverPendingWorkflows(ctx *dbosContext, executorIDs []string) ([]Workflow
 		status:             []WorkflowStatusType{WorkflowStatusPending},
 		executorIDs:        executorIDs,
 		applicationVersion: ctx.applicationVersion,
+		loadInput:          true,
 	})
 	if err != nil {
 		return nil, err
@@ -36,7 +37,13 @@ func recoverPendingWorkflows(ctx *dbosContext, executorIDs []string) ([]Workflow
 			continue
 		}
 
-		registeredWorkflow, exists := ctx.workflowRegistry[workflow.Name]
+		wfName, ok := ctx.workflowCustomNametoFQN.Load(workflow.Name)
+		if !ok {
+			ctx.logger.Error("Workflow not found in registry", "workflow_name", workflow.Name)
+			continue
+		}
+
+		registeredWorkflow, exists := ctx.workflowRegistry[wfName.(string)]
 		if !exists {
 			ctx.logger.Error("Workflow function not found in registry", "workflow_id", workflow.ID, "name", workflow.Name)
 			continue
