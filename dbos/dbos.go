@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -119,10 +120,9 @@ type dbosContext struct {
 	// Wait group for workflow goroutines
 	workflowsWg *sync.WaitGroup
 
-	// Workflow registry
-	workflowRegistry        map[string]workflowRegistryEntry
-	workflowRegMutex        *sync.RWMutex
-	workflowCustomNametoFQN sync.Map // Maps fully qualified workflow names to custom names. Usefor when client enqueues a workflow by name because registry is indexed by FQN.
+	// Workflow registry - read-mostly sync.Map since registration happens only before launch
+	workflowRegistry        *sync.Map // map[string]workflowRegistryEntry
+	workflowCustomNametoFQN *sync.Map // Maps fully qualified workflow names to custom names. Usefor when client enqueues a workflow by name because registry is indexed by FQN.
 
 	// Workflow scheduler
 	workflowScheduler *cron.Cron
@@ -158,15 +158,15 @@ func WithValue(ctx DBOSContext, key, val any) DBOSContext {
 	// Will do nothing if the concrete type is not dbosContext
 	if dbosCtx, ok := ctx.(*dbosContext); ok {
 		return &dbosContext{
-			ctx:                context.WithValue(dbosCtx.ctx, key, val), // Spawn a new child context with the value set
-			logger:             dbosCtx.logger,
-			systemDB:           dbosCtx.systemDB,
-			workflowsWg:        dbosCtx.workflowsWg,
-			workflowRegistry:   dbosCtx.workflowRegistry,
-			workflowRegMutex:   dbosCtx.workflowRegMutex,
-			applicationVersion: dbosCtx.applicationVersion,
-			executorID:         dbosCtx.executorID,
-			applicationID:      dbosCtx.applicationID,
+			ctx:                     context.WithValue(dbosCtx.ctx, key, val), // Spawn a new child context with the value set
+			logger:                  dbosCtx.logger,
+			systemDB:                dbosCtx.systemDB,
+			workflowsWg:             dbosCtx.workflowsWg,
+			workflowRegistry:        dbosCtx.workflowRegistry,
+			workflowCustomNametoFQN: dbosCtx.workflowCustomNametoFQN,
+			applicationVersion:      dbosCtx.applicationVersion,
+			executorID:              dbosCtx.executorID,
+			applicationID:           dbosCtx.applicationID,
 		}
 	}
 	return nil
@@ -181,15 +181,15 @@ func WithoutCancel(ctx DBOSContext) DBOSContext {
 	}
 	if dbosCtx, ok := ctx.(*dbosContext); ok {
 		return &dbosContext{
-			ctx:                context.WithoutCancel(dbosCtx.ctx),
-			logger:             dbosCtx.logger,
-			systemDB:           dbosCtx.systemDB,
-			workflowsWg:        dbosCtx.workflowsWg,
-			workflowRegistry:   dbosCtx.workflowRegistry,
-			workflowRegMutex:   dbosCtx.workflowRegMutex,
-			applicationVersion: dbosCtx.applicationVersion,
-			executorID:         dbosCtx.executorID,
-			applicationID:      dbosCtx.applicationID,
+			ctx:                     context.WithoutCancel(dbosCtx.ctx),
+			logger:                  dbosCtx.logger,
+			systemDB:                dbosCtx.systemDB,
+			workflowsWg:             dbosCtx.workflowsWg,
+			workflowRegistry:        dbosCtx.workflowRegistry,
+			workflowCustomNametoFQN: dbosCtx.workflowCustomNametoFQN,
+			applicationVersion:      dbosCtx.applicationVersion,
+			executorID:              dbosCtx.executorID,
+			applicationID:           dbosCtx.applicationID,
 		}
 	}
 	return nil
@@ -205,15 +205,15 @@ func WithTimeout(ctx DBOSContext, timeout time.Duration) (DBOSContext, context.C
 	if dbosCtx, ok := ctx.(*dbosContext); ok {
 		newCtx, cancelFunc := context.WithTimeoutCause(dbosCtx.ctx, timeout, errors.New("DBOS context timeout"))
 		return &dbosContext{
-			ctx:                newCtx,
-			logger:             dbosCtx.logger,
-			systemDB:           dbosCtx.systemDB,
-			workflowsWg:        dbosCtx.workflowsWg,
-			workflowRegistry:   dbosCtx.workflowRegistry,
-			workflowRegMutex:   dbosCtx.workflowRegMutex,
-			applicationVersion: dbosCtx.applicationVersion,
-			executorID:         dbosCtx.executorID,
-			applicationID:      dbosCtx.applicationID,
+			ctx:                     newCtx,
+			logger:                  dbosCtx.logger,
+			systemDB:                dbosCtx.systemDB,
+			workflowsWg:             dbosCtx.workflowsWg,
+			workflowRegistry:        dbosCtx.workflowRegistry,
+			workflowCustomNametoFQN: dbosCtx.workflowCustomNametoFQN,
+			applicationVersion:      dbosCtx.applicationVersion,
+			executorID:              dbosCtx.executorID,
+			applicationID:           dbosCtx.applicationID,
 		}, cancelFunc
 	}
 	return nil, func() {}
@@ -261,11 +261,11 @@ func (c *dbosContext) GetApplicationID() string {
 func NewDBOSContext(inputConfig Config) (DBOSContext, error) {
 	ctx, cancelFunc := context.WithCancelCause(context.Background())
 	initExecutor := &dbosContext{
-		workflowsWg:      &sync.WaitGroup{},
-		ctx:              ctx,
-		ctxCancelFunc:    cancelFunc,
-		workflowRegistry: make(map[string]workflowRegistryEntry),
-		workflowRegMutex: &sync.RWMutex{},
+		workflowsWg:             &sync.WaitGroup{},
+		ctx:                     ctx,
+		ctxCancelFunc:           cancelFunc,
+		workflowRegistry:        &sync.Map{},
+		workflowCustomNametoFQN: &sync.Map{},
 	}
 
 	// Load and process the configuration
@@ -438,7 +438,20 @@ func getBinaryHash() (string, error) {
 		return "", err
 	}
 
-	file, err := os.Open(execPath)
+	execPath, err = filepath.EvalSymlinks(execPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve self path: %w", err)
+	}
+
+	fi, err := os.Lstat(execPath)
+	if err != nil {
+		return "", err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("executable is not a regular file")
+	}
+
+	file, err := os.Open(execPath) // #nosec G304 -- opening our own executable, not user-supplied
 	if err != nil {
 		return "", err
 	}

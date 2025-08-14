@@ -58,14 +58,14 @@ type systemDatabase interface {
 	sleep(ctx context.Context, duration time.Duration) (time.Duration, error)
 
 	// Queues
-	dequeueWorkflows(ctx context.Context, queue WorkflowQueue, executorID, applicationVersion string) ([]dequeuedWorkflow, error)
+	dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInput) ([]dequeuedWorkflow, error)
 	clearQueueAssignment(ctx context.Context, workflowID string) (bool, error)
 }
 
 type sysDB struct {
 	pool                           *pgxpool.Pool
 	notificationListenerConnection *pgconn.PgConn
-	notificationLoopDone           chan bool
+	notificationLoopDone           chan struct{}
 	notificationsMap               *sync.Map
 	logger                         *slog.Logger
 	launched                       bool
@@ -104,7 +104,6 @@ func createDatabaseIfNotExists(ctx context.Context, databaseURL string, logger *
 		return newInitializationError(fmt.Sprintf("failed to check if database exists: %v", err))
 	}
 	if !exists {
-		// TODO: validate db name
 		createSQL := fmt.Sprintf("CREATE DATABASE %s", pgx.Identifier{dbName}.Sanitize())
 		_, err = conn.Exec(ctx, createSQL)
 		if err != nil {
@@ -119,7 +118,21 @@ func createDatabaseIfNotExists(ctx context.Context, databaseURL string, logger *
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const _DBOS_MIGRATION_TABLE = "dbos_schema_migrations"
+const (
+	_DBOS_MIGRATION_TABLE = "dbos_schema_migrations"
+
+	// PostgreSQL error codes
+	_PG_ERROR_UNIQUE_VIOLATION      = "23505"
+	_PG_ERROR_FOREIGN_KEY_VIOLATION = "23503"
+
+	// Notification channels
+	_DBOS_NOTIFICATIONS_CHANNEL   = "dbos_notifications_channel"
+	_DBOS_WORKFLOW_EVENTS_CHANNEL = "dbos_workflow_events_channel"
+
+	// Database retry timeouts
+	_DB_CONNECTION_RETRY_DELAY = 500 * time.Millisecond
+	_DB_RETRY_INTERVAL         = 1 * time.Second
+)
 
 func runMigrations(databaseURL string) error {
 	// Change the driver to pgx5
@@ -194,7 +207,7 @@ func newSystemDatabase(ctx context.Context, databaseURL string, logger *slog.Log
 		return nil, fmt.Errorf("failed to parse database URL: %v", err)
 	}
 	config.OnNotification = func(c *pgconn.PgConn, n *pgconn.Notification) {
-		if n.Channel == "dbos_notifications_channel" || n.Channel == "dbos_workflow_events_channel" {
+		if n.Channel == _DBOS_NOTIFICATIONS_CHANNEL || n.Channel == _DBOS_WORKFLOW_EVENTS_CHANNEL {
 			// Check if an entry exists in the map, indexed by the payload
 			// If yes, broadcast on the condition variable so listeners can wake up
 			if cond, exists := notificationsMap.Load(n.Payload); exists {
@@ -211,7 +224,7 @@ func newSystemDatabase(ctx context.Context, databaseURL string, logger *slog.Log
 		pool:                           pool,
 		notificationListenerConnection: notificationListenerConnection,
 		notificationsMap:               notificationsMap,
-		notificationLoopDone:           make(chan bool),
+		notificationLoopDone:           make(chan struct{}),
 		logger:                         logger,
 	}, nil
 }
@@ -230,7 +243,10 @@ func (s *sysDB) shutdown(ctx context.Context) {
 
 	// Context wasn't cancelled, let's manually close
 	if !errors.Is(ctx.Err(), context.Canceled) {
-		s.notificationListenerConnection.Close(ctx)
+		err := s.notificationListenerConnection.Close(ctx)
+		if err != nil {
+			s.logger.Error("Failed to close notification listener connection", "error", err)
+		}
 	}
 
 	if s.launched {
@@ -242,7 +258,7 @@ func (s *sysDB) shutdown(ctx context.Context) {
 	// Allow pgx health checks to complete
 	// https://github.com/jackc/pgx/blob/15bca4a4e14e0049777c1245dba4c16300fe4fd0/pgxpool/pool.go#L417
 	// These trigger go-leak alerts
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(_DB_CONNECTION_RETRY_DELAY)
 
 	s.launched = false
 }
@@ -290,7 +306,7 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 
 	var timeoutMs *int64 = nil
 	if input.status.Timeout > 0 {
-		millis := input.status.Timeout.Milliseconds()
+		millis := input.status.Timeout.Round(time.Millisecond).Milliseconds()
 		timeoutMs = &millis
 	}
 
@@ -377,7 +393,7 @@ func (s *sysDB) insertWorkflowStatus(ctx context.Context, input insertWorkflowSt
 	)
 	if err != nil {
 		// Handle unique constraint violation for the deduplication ID (this should be the only case for a 23505)
-		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == _PG_ERROR_UNIQUE_VIOLATION {
 			return nil, newQueueDeduplicatedError(
 				input.status.ID,
 				input.status.QueueName,
@@ -770,25 +786,17 @@ func (s *sysDB) resumeWorkflow(ctx context.Context, workflowID string) error {
 		return nil // Workflow is complete, do nothing
 	}
 
-	// If the original workflow has a timeout, let's recompute a deadline
-	var deadline *int64 = nil
-	if wf.Timeout > 0 {
-		deadlineMs := time.Now().Add(wf.Timeout).UnixMilli()
-		deadline = &deadlineMs
-	}
-
 	// Set the workflow's status to ENQUEUED and clear its recovery attempts, set new deadline
 	updateStatusQuery := `UPDATE dbos.workflow_status
 						  SET status = $1, queue_name = $2, recovery_attempts = $3, 
-						      workflow_deadline_epoch_ms = $4, deduplication_id = NULL,
-						      started_at_epoch_ms = NULL, updated_at = $5
-						  WHERE workflow_uuid = $6`
+						      workflow_deadline_epoch_ms = NULL, deduplication_id = NULL,
+						      started_at_epoch_ms = NULL, updated_at = $4
+						  WHERE workflow_uuid = $5`
 
 	_, err = tx.Exec(ctx, updateStatusQuery,
 		WorkflowStatusEnqueued,
 		_DBOS_INTERNAL_QUEUE_NAME,
 		0,
-		deadline,
 		time.Now().UnixMilli(),
 		workflowID)
 	if err != nil {
@@ -921,7 +929,7 @@ func (s *sysDB) awaitWorkflowResult(ctx context.Context, workflowID string) (any
 		err := row.Scan(&status, &outputString, &errorStr)
 		if err != nil {
 			if err == pgx.ErrNoRows {
-				time.Sleep(1 * time.Second)
+				time.Sleep(_DB_RETRY_INTERVAL)
 				continue
 			}
 			return nil, fmt.Errorf("failed to query workflow status: %w", err)
@@ -942,7 +950,7 @@ func (s *sysDB) awaitWorkflowResult(ctx context.Context, workflowID string) (any
 		case WorkflowStatusCancelled:
 			return output, newAwaitedWorkflowCancelledError(workflowID)
 		default:
-			time.Sleep(1 * time.Second)
+			time.Sleep(_DB_RETRY_INTERVAL)
 		}
 	}
 }
@@ -1000,7 +1008,7 @@ func (s *sysDB) recordOperationResult(ctx context.Context, input recordOperation
 
 	if err != nil {
 		s.logger.Error("RecordOperationResult Error occurred", "error", err)
-		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == _PG_ERROR_UNIQUE_VIOLATION {
 			return newWorkflowConflictIDError(input.workflowID)
 		}
 		return err
@@ -1051,7 +1059,7 @@ func (s *sysDB) recordChildWorkflow(ctx context.Context, input recordChildWorkfl
 
 	if err != nil {
 		// Check for unique constraint violation (conflict ID error)
-		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23505" {
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == _PG_ERROR_UNIQUE_VIOLATION {
 			return fmt.Errorf(
 				"child workflow %s already registered for parent workflow %s (operation ID: %d)",
 				input.childWorkflowID, input.parentWorkflowID, input.stepID)
@@ -1354,17 +1362,21 @@ func (s *sysDB) sleep(ctx context.Context, duration time.Duration) (time.Duratio
 
 func (s *sysDB) notificationListenerLoop(ctx context.Context) {
 	defer func() {
-		s.notificationLoopDone <- true
+		s.notificationLoopDone <- struct{}{}
 	}()
 
 	s.logger.Info("DBOS: Starting notification listener loop")
-	mrr := s.notificationListenerConnection.Exec(ctx, "LISTEN dbos_notifications_channel; LISTEN dbos_workflow_events_channel")
+	mrr := s.notificationListenerConnection.Exec(ctx, fmt.Sprintf("LISTEN %s; LISTEN %s", _DBOS_NOTIFICATIONS_CHANNEL, _DBOS_WORKFLOW_EVENTS_CHANNEL))
 	results, err := mrr.ReadAll()
 	if err != nil {
 		s.logger.Error("Failed to listen on notification channels", "error", err)
 		return
 	}
-	mrr.Close()
+	err = mrr.Close()
+	if err != nil {
+		s.logger.Error("Failed to close connection after setting notification listeners", "error", err)
+		return
+	}
 
 	for _, result := range results {
 		if result.Err != nil {
@@ -1390,9 +1402,10 @@ func (s *sysDB) notificationListenerLoop(ctx context.Context) {
 				return
 			}
 
-			// Other errors - log and retry. XXX eventually add exponential backoff + jitter
+			// Other errors - log and retry.
+			// TODO add exponential backoff + jitter
 			s.logger.Error("Error waiting for notification", "error", err)
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(_DB_CONNECTION_RETRY_DELAY)
 			continue
 		}
 	}
@@ -1465,7 +1478,7 @@ func (s *sysDB) send(ctx context.Context, input WorkflowSendInput) error {
 	_, err = tx.Exec(ctx, insertQuery, input.DestinationID, topic, messageString)
 	if err != nil {
 		// Check for foreign key violation (destination workflow doesn't exist)
-		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "23503" {
+		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == _PG_ERROR_FOREIGN_KEY_VIOLATION {
 			return newNonExistentWorkflowError(input.DestinationID)
 		}
 		return fmt.Errorf("failed to insert notification: %w", err)
@@ -1501,7 +1514,6 @@ func (s *sysDB) recv(ctx context.Context, input WorkflowRecvInput) (any, error) 
 	functionName := "DBOS.recv"
 
 	// Get workflow state from context
-	// XXX these checks might be better suited for outside of the system db code. We'll see when we implement the client.
 	wfState, ok := ctx.Value(workflowStateKey).(*workflowState)
 	if !ok || wfState == nil {
 		return nil, newStepExecutionError("", functionName, "workflow state not found in context: are you running this step within a workflow?")
@@ -1521,7 +1533,6 @@ func (s *sysDB) recv(ctx context.Context, input WorkflowRecvInput) (any, error) 
 	}
 
 	// Check if operation was already executed
-	// XXX this might not need to be in the transaction
 	checkInput := checkOperationExecutionDBInput{
 		workflowID: destinationID,
 		stepID:     stepID,
@@ -1548,7 +1559,6 @@ func (s *sysDB) recv(ctx context.Context, input WorkflowRecvInput) (any, error) 
 	}
 	defer func() {
 		// Clean up the condition variable after we're done and broadcast to wake up any waiting goroutines
-		// XXX We should handle panics in this function and make sure we call this. Not a problem for now as panic will crash the importing package.
 		cond.Broadcast()
 		s.notificationsMap.Delete(payload)
 	}()
@@ -1563,7 +1573,6 @@ func (s *sysDB) recv(ctx context.Context, input WorkflowRecvInput) (any, error) 
 	}
 	if !exists {
 		// Wait for notifications using condition variable with timeout pattern
-		// XXX should we prevent zero or negative timeouts?
 		s.logger.Debug("Waiting for notification on condition variable", "payload", payload)
 
 		done := make(chan struct{})
@@ -1783,7 +1792,7 @@ func (s *sysDB) getEvent(ctx context.Context, input WorkflowGetEventInput) (any,
 		return nil, fmt.Errorf("failed to query workflow event: %w", err)
 	}
 
-	if err == pgx.ErrNoRows || valueString == nil { // XXX valueString should never be `nil`
+	if err == pgx.ErrNoRows || valueString == nil { // valueString should never be `nil`
 		// Wait for notification with timeout using condition variable
 		done := make(chan struct{})
 		go func() {
@@ -1852,8 +1861,13 @@ type dequeuedWorkflow struct {
 	input string
 }
 
-// TODO input struct
-func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, executorID, applicationVersion string) ([]dequeuedWorkflow, error) {
+type dequeueWorkflowsInput struct {
+	queue              WorkflowQueue
+	executorID         string
+	applicationVersion string
+}
+
+func (s *sysDB) dequeueWorkflows(ctx context.Context, input dequeueWorkflowsInput) ([]dequeuedWorkflow, error) {
 	// Begin transaction with snapshot isolation
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1870,8 +1884,8 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 	// First check the rate limiter
 	startTimeMs := time.Now().UnixMilli()
 	var numRecentQueries int
-	if queue.RateLimit != nil {
-		limiterPeriod := time.Duration(queue.RateLimit.Period * float64(time.Second))
+	if input.queue.RateLimit != nil {
+		limiterPeriod := time.Duration(input.queue.RateLimit.Period * float64(time.Second))
 
 		// Calculate the cutoff time: current time minus limiter period
 		cutoffTimeMs := time.Now().Add(-limiterPeriod).UnixMilli()
@@ -1885,22 +1899,22 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 		  AND started_at_epoch_ms > $3`
 
 		err := tx.QueryRow(ctx, limiterQuery,
-			queue.Name,
+			input.queue.Name,
 			WorkflowStatusEnqueued,
 			cutoffTimeMs).Scan(&numRecentQueries)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query rate limiter: %w", err)
 		}
 
-		if numRecentQueries >= queue.RateLimit.Limit {
+		if numRecentQueries >= input.queue.RateLimit.Limit {
 			return []dequeuedWorkflow{}, nil
 		}
 	}
 
 	// Calculate max_tasks based on concurrency limits
-	maxTasks := queue.MaxTasksPerIteration
+	maxTasks := input.queue.MaxTasksPerIteration
 
-	if queue.WorkerConcurrency != nil || queue.GlobalConcurrency != nil {
+	if input.queue.WorkerConcurrency != nil || input.queue.GlobalConcurrency != nil {
 		// Count pending workflows by executor
 		pendingQuery := `
 			SELECT executor_id, COUNT(*) as task_count
@@ -1908,7 +1922,7 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 			WHERE queue_name = $1 AND status = $2
 			GROUP BY executor_id`
 
-		rows, err := tx.Query(ctx, pendingQuery, queue.Name, WorkflowStatusPending)
+		rows, err := tx.Query(ctx, pendingQuery, input.queue.Name, WorkflowStatusPending)
 		if err != nil {
 			return nil, fmt.Errorf("failed to query pending workflows: %w", err)
 		}
@@ -1924,28 +1938,28 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 			pendingWorkflowsDict[executorIDRow] = taskCount
 		}
 
-		localPendingWorkflows := pendingWorkflowsDict[executorID]
+		localPendingWorkflows := pendingWorkflowsDict[input.executorID]
 
 		// Check worker concurrency limit
-		if queue.WorkerConcurrency != nil {
-			workerConcurrency := *queue.WorkerConcurrency
+		if input.queue.WorkerConcurrency != nil {
+			workerConcurrency := *input.queue.WorkerConcurrency
 			if localPendingWorkflows > workerConcurrency {
-				s.logger.Warn("Local pending workflows on queue exceeds worker concurrency limit", "local_pending", localPendingWorkflows, "queue_name", queue.Name, "concurrency_limit", workerConcurrency)
+				s.logger.Warn("Local pending workflows on queue exceeds worker concurrency limit", "local_pending", localPendingWorkflows, "queue_name", input.queue.Name, "concurrency_limit", workerConcurrency)
 			}
 			availableWorkerTasks := max(workerConcurrency-localPendingWorkflows, 0)
 			maxTasks = availableWorkerTasks
 		}
 
 		// Check global concurrency limit
-		if queue.GlobalConcurrency != nil {
+		if input.queue.GlobalConcurrency != nil {
 			globalPendingWorkflows := 0
 			for _, count := range pendingWorkflowsDict {
 				globalPendingWorkflows += count
 			}
 
-			concurrency := *queue.GlobalConcurrency
+			concurrency := *input.queue.GlobalConcurrency
 			if globalPendingWorkflows > concurrency {
-				s.logger.Warn("Total pending workflows on queue exceeds global concurrency limit", "total_pending", globalPendingWorkflows, "queue_name", queue.Name, "concurrency_limit", concurrency)
+				s.logger.Warn("Total pending workflows on queue exceeds global concurrency limit", "total_pending", globalPendingWorkflows, "queue_name", input.queue.Name, "concurrency_limit", concurrency)
 			}
 			availableTasks := max(concurrency-globalPendingWorkflows, 0)
 			if availableTasks < maxTasks {
@@ -1957,7 +1971,7 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 	// Build the query to select workflows for dequeueing
 	// Use SKIP LOCKED when no global concurrency is set to avoid blocking,
 	// otherwise use NOWAIT to ensure consistent view across processes
-	skipLocks := queue.GlobalConcurrency == nil
+	skipLocks := input.queue.GlobalConcurrency == nil
 	var lockClause string
 	if skipLocks {
 		lockClause = "FOR UPDATE SKIP LOCKED"
@@ -1966,7 +1980,7 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 	}
 
 	var query string
-	if queue.PriorityEnabled {
+	if input.queue.PriorityEnabled {
 		query = fmt.Sprintf(`
 			SELECT workflow_uuid
 			FROM dbos.workflow_status
@@ -1991,7 +2005,7 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 	}
 
 	// Execute the query to get workflow IDs
-	rows, err := tx.Query(ctx, query, queue.Name, WorkflowStatusEnqueued, applicationVersion)
+	rows, err := tx.Query(ctx, query, input.queue.Name, WorkflowStatusEnqueued, input.applicationVersion)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query enqueued workflows: %w", err)
 	}
@@ -2014,15 +2028,15 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 	}
 
 	if len(dequeuedIDs) > 0 {
-		s.logger.Debug("attempting to dequeue task(s)", "queueName", queue.Name, "numTasks", len(dequeuedIDs))
+		s.logger.Debug("attempting to dequeue task(s)", "queueName", input.queue.Name, "numTasks", len(dequeuedIDs))
 	}
 
 	// Update workflows to PENDING status and get their details
 	var retWorkflows []dequeuedWorkflow
 	for _, id := range dequeuedIDs {
 		// If we have a limiter, stop dequeueing workflows when the number of workflows started this period exceeds the limit.
-		if queue.RateLimit != nil {
-			if len(retWorkflows)+numRecentQueries >= queue.RateLimit.Limit {
+		if input.queue.RateLimit != nil {
+			if len(retWorkflows)+numRecentQueries >= input.queue.RateLimit.Limit {
 				break
 			}
 		}
@@ -2048,8 +2062,8 @@ func (s *sysDB) dequeueWorkflows(ctx context.Context, queue WorkflowQueue, execu
 		var inputString *string
 		err := tx.QueryRow(ctx, updateQuery,
 			WorkflowStatusPending,
-			applicationVersion,
-			executorID,
+			input.applicationVersion,
+			input.executorID,
 			startTimeMs,
 			id).Scan(&retWorkflow.name, &inputString)
 

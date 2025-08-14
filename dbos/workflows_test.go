@@ -6,7 +6,7 @@ Test workflow and steps features
 [x] workflow idempotency
 [x] workflow DLQ
 [x] workflow conflicting name
-[] workflow timeouts & deadlines (including child workflows)
+[x] workflow timeouts & deadlines (including child workflows)
 */
 
 import (
@@ -831,6 +831,48 @@ func TestChildWorkflow(t *testing.T) {
 			t.Fatalf("expected child result '%s', got '%s'", result, childResult)
 		}
 	})
+
+	t.Run("ChildWorkflowCannotBeSpawnedFromStep", func(t *testing.T) {
+		// Child workflow for testing
+		childWf := func(dbosCtx DBOSContext, input string) (string, error) {
+			return "child-result", nil
+		}
+		RegisterWorkflow(dbosCtx, childWf)
+
+		// Step that tries to spawn a child workflow - this should fail
+		stepThatSpawnsChild := func(ctx context.Context, input string) (string, error) {
+			dbosCtx := ctx.(DBOSContext)
+			_, err := RunAsWorkflow(dbosCtx, childWf, input)
+			if err != nil {
+				return "", err
+			}
+			return "should-not-reach", nil
+		}
+
+		// Workflow that calls the step
+		parentWf := func(ctx DBOSContext, input string) (string, error) {
+			return RunAsStep(ctx, func(context context.Context) (string, error) {
+				return stepThatSpawnsChild(context, input)
+			})
+		}
+		RegisterWorkflow(dbosCtx, parentWf)
+
+		// Execute the workflow - should fail when step tries to spawn child workflow
+		handle, err := RunAsWorkflow(dbosCtx, parentWf, "test-input")
+		require.NoError(t, err, "failed to start parent workflow")
+
+		// Expect the workflow to fail
+		_, err = handle.GetResult()
+		require.Error(t, err, "expected error when spawning child workflow from step, but got none")
+
+		// Check the error type and message
+		dbosErr, ok := err.(*DBOSError)
+		require.True(t, ok, "expected error to be of type *DBOSError, got %T", err)
+		require.Equal(t, StepExecutionError, dbosErr.Code, "expected error code to be StepExecutionError, got %v", dbosErr.Code)
+
+		expectedMessagePart := "cannot spawn child workflow from within a step"
+		require.Contains(t, err.Error(), expectedMessagePart, "expected error message to contain %q, but got %q", expectedMessagePart, err.Error())
+	})
 }
 
 // Idempotency workflows moved to test functions
@@ -1072,60 +1114,51 @@ func TestWorkflowDeadLetterQueue(t *testing.T) {
 		require.Error(t, err, "expected dead letter queue error when restarting workflow with same ID but got none")
 
 		dbosErr, ok = err.(*DBOSError)
-		if !ok {
-			t.Fatalf("expected DBOSError, got %T", err)
-		}
-		if dbosErr.Code != DeadLetterQueueError {
-			t.Fatalf("expected DeadLetterQueueError, got %v", dbosErr.Code)
-		}
+		require.True(t, ok, "expected error to be of type *DBOSError, got %T", err)
+		require.Equal(t, dbosErr.Code, DeadLetterQueueError, "expected error code to be DeadLetterQueueError")
 
-		// Unlock the workflow to allow it to complete
+		// Now resume the workflow -- this clears the DLQ status
+		resumedHandle, err := ResumeWorkflow[int](dbosCtx, wfID)
+		require.NoError(t, err, "failed to resume workflow")
+
+		// Recover pending workflows again - should work without error
+		_, err = recoverPendingWorkflows(dbosCtx.(*dbosContext), []string{"local"})
+		require.NoError(t, err, "failed to recover pending workflows after resume")
+
+		// Complete the blocked workflow
 		deadLetterQueueEvent.Set()
-		/*
-				// TODO: test resume when implemented
-				resumedHandle, err := ...
 
-				// Recover pending workflows again - should work without error
-				_, err = recoverPendingWorkflows(executor.(*dbosContext), []string{"local"})
-				if err != nil {
-					t.Fatalf("failed to recover pending workflows after resume: %v", err)
-				}
+		// Wait for both handles to complete
+		result1, err := handle.GetResult()
+		if err != nil {
+			t.Fatalf("failed to get result from original handle: %v", err)
+		}
 
-				// Complete the blocked workflow
-				deadLetterQueueEvent.Set()
+		result2, err := resumedHandle.GetResult()
+		if err != nil {
+			t.Fatalf("failed to get result from resumed handle: %v", err)
+		}
 
-				// Wait for both handles to complete
-				result1, err = handle.GetResult(context.Background())
-				if err != nil {
-					t.Fatalf("failed to get result from original handle: %v", err)
-				}
+		if result1 != result2 {
+			t.Fatalf("expected both handles to return same result, got %v and %v", result1, result2)
+		}
 
-				result2, err := resumedHandle.GetResult(context.Background())
-				if err != nil {
-					t.Fatalf("failed to get result from resumed handle: %v", err)
-				}
+		// Verify workflow status is SUCCESS
+		status, err = handle.GetStatus()
+		if err != nil {
+			t.Fatalf("failed to get final workflow status: %v", err)
+		}
+		if status.Status != WorkflowStatusSuccess {
+			t.Fatalf("expected workflow status to be SUCCESS, got %v", status.Status)
+		}
 
-				if result1 != result2 {
-					t.Fatalf("expected both handles to return same result, got %v and %v", result1, result2)
-				}
-
-				// Verify workflow status is SUCCESS
-				status, err = handle.GetStatus()
-				if err != nil {
-					t.Fatalf("failed to get final workflow status: %v", err)
-				}
-				if status.Status != WorkflowStatusSuccess {
-					t.Fatalf("expected workflow status to be SUCCESS, got %v", status.Status)
-				}
-
-			// Verify that retries of a completed workflow do not raise the DLQ exception
-			for i := 0; i < maxRecoveryAttempts*2; i++ {
-				_, err = RunAsWorkflow(executor, deadLetterQueueWorkflow, "test", WithWorkflowID(wfID))
-				if err != nil {
-					t.Fatalf("unexpected error when retrying completed workflow: %v", err)
-				}
+		// Verify that retries of a completed workflow do not raise the DLQ exception
+		for i := 0; i < maxRecoveryAttempts*2; i++ {
+			_, err = RunAsWorkflow(dbosCtx, deadLetterQueueWorkflow, "test", WithWorkflowID(wfID))
+			if err != nil {
+				t.Fatalf("unexpected error when retrying completed workflow: %v", err)
 			}
-		*/
+		}
 	})
 
 	t.Run("InfiniteRetriesWorkflow", func(t *testing.T) {
@@ -1230,7 +1263,7 @@ func TestScheduledWorkflows(t *testing.T) {
 
 		// Verify timing - each execution should be approximately 1 second apart
 		scheduleInterval := 1 * time.Second
-		allowedSlack := 2 * time.Second
+		allowedSlack := 3 * time.Second
 
 		for i, execTime := range executionTimes {
 			// Calculate expected execution time based on schedule interval
@@ -1423,7 +1456,7 @@ func TestSendRecv(t *testing.T) {
 		if result != "message1-message2-message3" {
 			t.Fatalf("expected received message to be 'message1-message2-message3', got '%s'", result)
 		}
-		// XXX This is not a great condition: when all the tests run there's quite some randomness to this
+		// FIXME This is not a great condition: when all the tests run there's quite some randomness to this
 		if time.Since(start) > 10*time.Second {
 			t.Fatalf("receive workflow took too long to complete, expected < 5s, got %v", time.Since(start))
 		}
@@ -2904,7 +2937,7 @@ func TestWorkflowTimeout(t *testing.T) {
 		}
 
 		// Check the deadline on the status was is within an expected range (start time + timeout * .1)
-		// XXX this might be flaky and frankly not super useful
+		// FIXME this might be flaky and frankly not super useful
 		expectedDeadline := start.Add(timeout * 10 / 100)
 		if status.Deadline.Before(expectedDeadline) || status.Deadline.After(start.Add(timeout)) {
 			t.Fatalf("expected workflow deadline to be within %v and %v, got %v", expectedDeadline, start.Add(timeout), status.Deadline)

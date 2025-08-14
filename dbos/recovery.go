@@ -32,7 +32,7 @@ func recoverPendingWorkflows(ctx *dbosContext, executorIDs []string) ([]Workflow
 				continue
 			}
 			if cleared {
-				workflowHandles = append(workflowHandles, &workflowPollingHandle[any]{workflowID: workflow.ID, dbosContext: ctx})
+				workflowHandles = append(workflowHandles, newWorkflowPollingHandle[any](ctx, workflow.ID))
 			}
 			continue
 		}
@@ -43,9 +43,14 @@ func recoverPendingWorkflows(ctx *dbosContext, executorIDs []string) ([]Workflow
 			continue
 		}
 
-		registeredWorkflow, exists := ctx.workflowRegistry[wfName.(string)]
+		registeredWorkflowAny, exists := ctx.workflowRegistry.Load(wfName.(string))
 		if !exists {
 			ctx.logger.Error("Workflow function not found in registry", "workflow_id", workflow.ID, "name", workflow.Name)
+			continue
+		}
+		registeredWorkflow, ok := registeredWorkflowAny.(workflowRegistryEntry)
+		if !ok {
+			ctx.logger.Error("invalid workflow registry entry type", "workflow_id", workflow.ID, "name", workflow.Name)
 			continue
 		}
 

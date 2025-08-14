@@ -145,7 +145,7 @@ type queueRunner struct {
 	workflowQueueRegistry map[string]WorkflowQueue
 
 	// Channel to signal completion back to the DBOS context
-	completionChan chan bool
+	completionChan chan struct{}
 }
 
 func newQueueRunner() *queueRunner {
@@ -158,7 +158,7 @@ func newQueueRunner() *queueRunner {
 		jitterMin:             0.95,
 		jitterMax:             1.05,
 		workflowQueueRegistry: make(map[string]WorkflowQueue),
-		completionChan:        make(chan bool),
+		completionChan:        make(chan struct{}),
 	}
 }
 
@@ -179,7 +179,11 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 		// Iterate through all queues in the registry
 		for queueName, queue := range qr.workflowQueueRegistry {
 			// Call DequeueWorkflows for each queue
-			dequeuedWorkflows, err := ctx.systemDB.dequeueWorkflows(ctx, queue, ctx.executorID, ctx.applicationVersion)
+			dequeuedWorkflows, err := ctx.systemDB.dequeueWorkflows(ctx, dequeueWorkflowsInput{
+				queue:              queue,
+				executorID:         ctx.executorID,
+				applicationVersion: ctx.applicationVersion,
+			})
 			if err != nil {
 				if pgErr, ok := err.(*pgconn.PgError); ok {
 					switch pgErr.Code {
@@ -206,9 +210,14 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 					continue
 				}
 
-				registeredWorkflow, exists := ctx.workflowRegistry[wfName.(string)]
+				registeredWorkflowAny, exists := ctx.workflowRegistry.Load(wfName.(string))
 				if !exists {
 					ctx.logger.Error("workflow function not found in registry", "workflow_name", workflow.name)
+					continue
+				}
+				registeredWorkflow, ok := registeredWorkflowAny.(workflowRegistryEntry)
+				if !ok {
+					ctx.logger.Error("invalid workflow registry entry type", "workflow_name", workflow.name)
 					continue
 				}
 
@@ -245,14 +254,14 @@ func (qr *queueRunner) run(ctx *dbosContext) {
 		}
 
 		// Apply jitter to the polling interval
-		jitter := qr.jitterMin + rand.Float64()*(qr.jitterMax-qr.jitterMin)
+		jitter := qr.jitterMin + rand.Float64()*(qr.jitterMax-qr.jitterMin) // #nosec G404 -- non-crypto jitter; acceptable
 		sleepDuration := time.Duration(pollingInterval * jitter * float64(time.Second))
 
 		// Sleep with jittered interval, but allow early exit on context cancellation
 		select {
 		case <-ctx.Done():
 			ctx.logger.Info("Queue runner stopping due to context cancellation", "cause", context.Cause(ctx))
-			qr.completionChan <- true
+			qr.completionChan <- struct{}{}
 			return
 		case <-time.After(sleepDuration):
 			// Continue to next iteration
