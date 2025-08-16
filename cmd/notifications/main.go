@@ -162,6 +162,56 @@ func workerTask(ctx dbos.DBOSContext, workerID int) (string, error) {
 	return fmt.Sprintf("Worker %d finished after %s", workerID, workDuration), nil
 }
 
+// sendNotificationFromFunction demonstrates using Send from a regular function (not a workflow)
+func sendNotificationFromFunction(ctx dbos.DBOSContext, recipientID, topic, message string) error {
+	fmt.Printf("📨 Function: Sending notification '%s' to %s on topic '%s'\n", message, recipientID, topic)
+	
+	err := dbos.Send(ctx, dbos.GenericWorkflowSendInput[string]{
+		DestinationID: recipientID,
+		Topic:         topic,
+		Message:       message,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to send notification from function: %w", err)
+	}
+	
+	fmt.Printf("✅ Function: Notification sent successfully\n")
+	return nil
+}
+
+// alertService simulates an external service that sends alerts
+func alertService(ctx dbos.DBOSContext, alertType, message string) error {
+	fmt.Printf("🚨 Alert Service: Processing %s alert: %s\n", alertType, message)
+	
+	// Send alert to monitoring workflow
+	err := dbos.Send(ctx, dbos.GenericWorkflowSendInput[string]{
+		DestinationID: "monitoring_system",
+		Topic:         fmt.Sprintf("alert_%s", alertType),
+		Message:       fmt.Sprintf("[%s] %s", alertType, message),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to send alert: %w", err)
+	}
+	
+	return nil
+}
+
+// monitoringWorkflow receives and processes alerts
+func monitoringWorkflow(ctx dbos.DBOSContext, alertType string) (string, error) {
+	fmt.Printf("🖥️ Monitoring: Waiting for %s alerts...\n", alertType)
+	
+	alert, err := dbos.Recv[string](ctx, dbos.WorkflowRecvInput{
+		Topic:   fmt.Sprintf("alert_%s", alertType),
+		Timeout: 60 * time.Second,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to receive alert: %w", err)
+	}
+	
+	fmt.Printf("🖥️ Monitoring: Received alert: %s\n", alert)
+	return fmt.Sprintf("Processed alert: %s", alert), nil
+}
+
 
 func main() {
 	// Get database URL from environment or use default
@@ -187,6 +237,7 @@ func main() {
 	dbos.RegisterWorkflow(ctx, paymentConfirmationService)
 	dbos.RegisterWorkflow(ctx, coordinatorWorkflow)
 	dbos.RegisterWorkflow(ctx, workerTask)
+	dbos.RegisterWorkflow(ctx, monitoringWorkflow)
 
 	// Launch DBOS runtime
 	err = ctx.Launch()
@@ -287,10 +338,63 @@ func main() {
 	}
 
 
+	// Example 4: Send from regular functions (not workflows)
+	fmt.Println("\n📌 Example 4: Send from Regular Functions")
+	fmt.Println("Demonstrating Send usage outside of workflows...")
+	
+	// Start monitoring workflow to receive alerts
+	monitorHandle, err := dbos.RunAsWorkflow(ctx, monitoringWorkflow, "critical",
+		dbos.WithWorkflowID("monitoring_system"))
+	if err != nil {
+		log.Printf("Failed to start monitoring workflow: %v", err)
+	} else {
+		// Give monitoring workflow time to start
+		time.Sleep(100 * time.Millisecond)
+		
+		// Send alert from regular function
+		err = alertService(ctx, "critical", "Database connection lost")
+		if err != nil {
+			log.Printf("Failed to send alert: %v", err)
+		}
+		
+		// Get monitoring result
+		monitorResult, err := monitorHandle.GetResult()
+		if err != nil {
+			log.Printf("Monitoring failed: %v", err)
+		} else {
+			fmt.Printf("Monitoring result: %s\n", monitorResult)
+		}
+	}
+	
+	// Start a simple receiver for function notification
+	simpleRecvHandle, err := dbos.RunAsWorkflow(ctx, receiveWorkflow, "function_topic",
+		dbos.WithWorkflowID("function_receiver"))
+	if err != nil {
+		log.Printf("Failed to start function receiver: %v", err)
+	} else {
+		// Give receiver time to start
+		time.Sleep(100 * time.Millisecond)
+		
+		// Send notification from regular function
+		err = sendNotificationFromFunction(ctx, "function_receiver", "function_topic", "Hello from regular function!")
+		if err != nil {
+			log.Printf("Failed to send from function: %v", err)
+		}
+		
+		// Get receiver result
+		funcRecvResult, err := simpleRecvHandle.GetResult()
+		if err != nil {
+			log.Printf("Function receiver failed: %v", err)
+		} else {
+			fmt.Printf("Function receiver result: %s\n", funcRecvResult)
+		}
+	}
+
 	fmt.Println("\n✅ Durable Notifications Example Complete!")
 	fmt.Println("Key features demonstrated:")
 	fmt.Println("• Send/Receive pattern for workflow communication")
 	fmt.Println("• Payment confirmation with timeout handling")
 	fmt.Println("• Coordinator-worker pattern for distributed tasks")
+	fmt.Println("• Send notifications from regular functions (not just workflows)")
 	fmt.Println("• All notifications stored durably in Postgres with exactly-once semantics")
 }
